@@ -1,0 +1,1969 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Sep 29 12:22:19 2026
+
+@author: 396373
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+import calendar
+import csv
+import sys
+import traceback
+
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+
+
+# =============================================================================
+# DEFAULTS
+# =============================================================================
+
+DEFAULT_TURBINE_NAME = "IceWind RW600"
+DEFAULT_RATED_POWER_KW = 0.600
+DEFAULT_PEAK_POWER_KW = 3.000
+DEFAULT_CUT_IN_SPEED = 2.5
+DEFAULT_RATED_SPEED = 10.0
+DEFAULT_CUT_OUT_SPEED = 25.0
+DEFAULT_SURVIVAL_SPEED = 70.0
+
+DEFAULT_REFERENCE_HEIGHT_M = 10.0
+DEFAULT_TURBINE_HEIGHT_M = 10.0
+DEFAULT_POWER_LAW_EXPONENT = 0.14
+
+DEFAULT_TIME_COLUMN = "Time(norwegian mean time)"
+DEFAULT_WIND_COLUMN = "Mean wind speed"
+
+
+# =============================================================================
+# DATA CLASS
+# =============================================================================
+
+@dataclass(frozen=True)
+class TurbineParameters:
+    name: str
+    rated_power_kw: float
+    peak_power_kw: float
+    cut_in_speed: float
+    rated_speed: float
+    cut_out_speed: float
+    survival_speed: float
+    reference_height_m: float
+    turbine_height_m: float
+    power_law_exponent: float
+
+
+# =============================================================================
+# TKINTER
+# =============================================================================
+
+def _new_hidden_root():
+    import tkinter as tk
+
+    root = tk.Tk()
+    root.withdraw()
+
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+
+    return root
+
+
+def select_input_file() -> Path:
+    from tkinter import filedialog
+
+    root = _new_hidden_root()
+
+    try:
+        selected = filedialog.askopenfilename(
+            parent=root,
+            title="Seleziona il file meteorologico",
+            filetypes=[
+                ("File meteorologici", "*.csv *.xlsx *.xls"),
+                ("CSV", "*.csv"),
+                ("Excel", "*.xlsx *.xls"),
+                ("Tutti i file", "*.*"),
+            ],
+        )
+    finally:
+        root.destroy()
+
+    if not selected:
+        raise SystemExit("Selezione file annullata.")
+
+    return Path(selected)
+
+
+def select_output_file(default_directory: Path, default_filename: str) -> Path:
+    from tkinter import filedialog
+
+    root = _new_hidden_root()
+
+    try:
+        selected = filedialog.asksaveasfilename(
+            parent=root,
+            title="Salva i risultati",
+            initialdir=str(default_directory),
+            initialfile=default_filename,
+            defaultextension=".xlsx",
+            filetypes=[
+                ("File Excel", "*.xlsx"),
+                ("Tutti i file", "*.*"),
+            ],
+        )
+    finally:
+        root.destroy()
+
+    if not selected:
+        raise SystemExit("Salvataggio annullato.")
+
+    path = Path(selected)
+
+    if path.suffix.lower() != ".xlsx":
+        path = path.with_suffix(".xlsx")
+
+    return path
+
+
+def show_error(title: str, message: str) -> None:
+    from tkinter import messagebox
+
+    root = _new_hidden_root()
+
+    try:
+        messagebox.showerror(title, message, parent=root)
+    finally:
+        root.destroy()
+
+
+def show_info(title: str, message: str) -> None:
+    from tkinter import messagebox
+
+    root = _new_hidden_root()
+
+    try:
+        messagebox.showinfo(title, message, parent=root)
+    finally:
+        root.destroy()
+
+
+def ask_yes_no(title: str, message: str) -> bool:
+    from tkinter import messagebox
+
+    root = _new_hidden_root()
+
+    try:
+        result = messagebox.askyesno(title, message, parent=root)
+    finally:
+        root.destroy()
+
+    return bool(result)
+
+
+def choose_from_list_dialog(
+    title: str,
+    message: str,
+    values: list[str],
+    default: str,
+) -> str:
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+
+    if not values:
+        raise ValueError("Non ci sono valori disponibili nella lista.")
+
+    result: dict[str, str | None] = {"value": None}
+
+    dialog = tk.Tk()
+    dialog.title(title)
+    dialog.resizable(False, False)
+
+    try:
+        dialog.attributes("-topmost", True)
+    except Exception:
+        pass
+
+    frame = ttk.Frame(dialog, padding=16)
+    frame.grid(row=0, column=0, sticky="nsew")
+
+    ttk.Label(
+        frame,
+        text=message,
+        justify="left",
+        wraplength=650,
+    ).grid(
+        row=0,
+        column=0,
+        columnspan=2,
+        sticky="w",
+        pady=(0, 10),
+    )
+
+    variable = tk.StringVar(value=default)
+
+    combo = ttk.Combobox(
+        frame,
+        textvariable=variable,
+        values=values,
+        state="readonly",
+        width=max(24, min(70, max(len(v) for v in values) + 2)),
+    )
+    combo.grid(
+        row=1,
+        column=0,
+        columnspan=2,
+        sticky="ew",
+        pady=(0, 12),
+    )
+
+    def accept():
+        value = variable.get().strip()
+
+        if value not in values:
+            messagebox.showerror(
+                "Valore non valido",
+                "Seleziona un valore dalla lista.",
+                parent=dialog,
+            )
+            return
+
+        result["value"] = value
+        dialog.destroy()
+
+    def cancel():
+        dialog.destroy()
+
+    ttk.Button(
+        frame,
+        text="OK",
+        command=accept,
+    ).grid(row=2, column=0, padx=(0, 5))
+
+    ttk.Button(
+        frame,
+        text="Annulla",
+        command=cancel,
+    ).grid(row=2, column=1, padx=(5, 0))
+
+    dialog.protocol("WM_DELETE_WINDOW", cancel)
+    dialog.bind("<Return>", lambda _event: accept())
+    dialog.bind("<Escape>", lambda _event: cancel())
+
+    dialog.update_idletasks()
+
+    x = (dialog.winfo_screenwidth() - dialog.winfo_reqwidth()) // 2
+    y = (dialog.winfo_screenheight() - dialog.winfo_reqheight()) // 2
+
+    dialog.geometry(f"+{x}+{y}")
+    dialog.lift()
+    dialog.focus_force()
+    combo.focus_set()
+    dialog.mainloop()
+
+    if result["value"] is None:
+        raise SystemExit("Operazione annullata.")
+
+    return str(result["value"])
+
+
+def ask_analysis_setup(
+    candidate_years: list[int],
+    year_counts: dict[int, int],
+    missing_years: dict[int, int],
+) -> tuple[int, TurbineParameters, bool]:
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+
+    if not candidate_years:
+        raise ValueError("Non sono disponibili anni analizzabili.")
+
+    default_year = 2015 if 2015 in candidate_years else candidate_years[0]
+
+    result: dict[str, object | None] = {
+        "year": None,
+        "params": None,
+        "interpolate": None,
+    }
+
+    dialog = tk.Tk()
+    dialog.title("Impostazioni analisi eolica")
+    dialog.resizable(False, False)
+
+    try:
+        dialog.attributes("-topmost", True)
+    except Exception:
+        pass
+
+    outer = ttk.Frame(dialog, padding=16)
+    outer.grid(row=0, column=0, sticky="nsew")
+
+    ttk.Label(
+        outer,
+        text="Analisi capacity factor - IceWind RW600",
+        font=("TkDefaultFont", 11, "bold"),
+    ).grid(
+        row=0,
+        column=0,
+        columnspan=3,
+        sticky="w",
+    )
+
+    ttk.Label(
+        outer,
+        text=(
+            "Seleziona l'anno. I valori proposti sono i default del modello. "
+            "Puoi modificarli prima di avviare l'analisi."
+        ),
+        justify="left",
+        wraplength=650,
+    ).grid(
+        row=1,
+        column=0,
+        columnspan=3,
+        sticky="w",
+        pady=(4, 12),
+    )
+
+    ttk.Label(
+        outer,
+        text="Anno da analizzare",
+    ).grid(
+        row=2,
+        column=0,
+        sticky="w",
+        pady=(3, 10),
+    )
+
+    year_labels = [
+        f"{year} ({year_counts[year]} righe, "
+        f"{missing_years.get(year, 0)} ore mancanti)"
+        for year in candidate_years
+    ]
+
+    default_index = candidate_years.index(default_year)
+    year_var = tk.StringVar(value=year_labels[default_index])
+
+    year_combo = ttk.Combobox(
+        outer,
+        textvariable=year_var,
+        values=year_labels,
+        state="readonly",
+        width=42,
+    )
+    year_combo.grid(
+        row=2,
+        column=1,
+        columnspan=2,
+        sticky="ew",
+        padx=(12, 8),
+        pady=(3, 10),
+    )
+
+    ttk.Separator(
+        outer,
+        orient="horizontal",
+    ).grid(
+        row=3,
+        column=0,
+        columnspan=3,
+        sticky="ew",
+        pady=(2, 10),
+    )
+
+    fields = [
+        ("Nome turbina", "name", DEFAULT_TURBINE_NAME, ""),
+        ("Potenza nominale", "rated_power_kw", DEFAULT_RATED_POWER_KW, "kW"),
+        ("Potenza di picco", "peak_power_kw", DEFAULT_PEAK_POWER_KW, "kW"),
+        ("Velocità cut-in", "cut_in_speed", DEFAULT_CUT_IN_SPEED, "m/s"),
+        ("Velocità nominale", "rated_speed", DEFAULT_RATED_SPEED, "m/s"),
+        ("Velocità cut-out", "cut_out_speed", DEFAULT_CUT_OUT_SPEED, "m/s"),
+        (
+            "Velocità di sopravvivenza",
+            "survival_speed",
+            DEFAULT_SURVIVAL_SPEED,
+            "m/s",
+        ),
+        (
+            "Altezza di riferimento del vento",
+            "reference_height_m",
+            DEFAULT_REFERENCE_HEIGHT_M,
+            "m",
+        ),
+        (
+            "Altezza turbina / hub equivalente",
+            "turbine_height_m",
+            DEFAULT_TURBINE_HEIGHT_M,
+            "m",
+        ),
+        (
+            "Esponente power law α",
+            "power_law_exponent",
+            DEFAULT_POWER_LAW_EXPONENT,
+            "-",
+        ),
+    ]
+
+    variables: dict[str, tk.StringVar] = {}
+
+    first_field_row = 4
+
+    for row_index, (label, key, default, unit) in enumerate(
+        fields,
+        start=first_field_row,
+    ):
+        ttk.Label(
+            outer,
+            text=label,
+        ).grid(
+            row=row_index,
+            column=0,
+            sticky="w",
+            pady=3,
+        )
+
+        variable = tk.StringVar(value=str(default))
+        variables[key] = variable
+
+        ttk.Entry(
+            outer,
+            textvariable=variable,
+            width=25,
+        ).grid(
+            row=row_index,
+            column=1,
+            sticky="ew",
+            padx=(12, 8),
+            pady=3,
+        )
+
+        ttk.Label(
+            outer,
+            text=unit,
+            width=6,
+        ).grid(
+            row=row_index,
+            column=2,
+            sticky="w",
+            pady=3,
+        )
+
+    note_row = first_field_row + len(fields)
+
+    ttk.Separator(
+        outer,
+        orient="horizontal",
+    ).grid(
+        row=note_row,
+        column=0,
+        columnspan=3,
+        sticky="ew",
+        pady=(12, 8),
+    )
+
+    interpolate_var = tk.BooleanVar(value=True)
+
+    ttk.Checkbutton(
+        outer,
+        text=(
+            "Interpola linearmente le ore mancanti "
+            "(consigliato solo per gap brevi)"
+        ),
+        variable=interpolate_var,
+    ).grid(
+        row=note_row + 1,
+        column=0,
+        columnspan=3,
+        sticky="w",
+    )
+
+    ttk.Label(
+        outer,
+        text=(
+            "La potenza di picco è salvata come informazione, ma il modello "
+            "limita la potenza alla potenza nominale."
+        ),
+        justify="left",
+        wraplength=650,
+    ).grid(
+        row=note_row + 2,
+        column=0,
+        columnspan=3,
+        sticky="w",
+        pady=(8, 0),
+    )
+
+    def parse_float(key: str, label: str) -> float:
+        raw = variables[key].get().strip().replace(",", ".")
+
+        try:
+            return float(raw)
+        except ValueError as exc:
+            raise ValueError(f"'{label}' deve essere un numero.") from exc
+
+    def accept():
+        try:
+            selected_label = year_var.get()
+            selected_year = int(selected_label.split()[0])
+
+            params = TurbineParameters(
+                name=variables["name"].get().strip() or DEFAULT_TURBINE_NAME,
+                rated_power_kw=parse_float(
+                    "rated_power_kw",
+                    "Potenza nominale",
+                ),
+                peak_power_kw=parse_float(
+                    "peak_power_kw",
+                    "Potenza di picco",
+                ),
+                cut_in_speed=parse_float(
+                    "cut_in_speed",
+                    "Cut-in",
+                ),
+                rated_speed=parse_float(
+                    "rated_speed",
+                    "Velocità nominale",
+                ),
+                cut_out_speed=parse_float(
+                    "cut_out_speed",
+                    "Cut-out",
+                ),
+                survival_speed=parse_float(
+                    "survival_speed",
+                    "Velocità di sopravvivenza",
+                ),
+                reference_height_m=parse_float(
+                    "reference_height_m",
+                    "Altezza di riferimento",
+                ),
+                turbine_height_m=parse_float(
+                    "turbine_height_m",
+                    "Altezza turbina",
+                ),
+                power_law_exponent=parse_float(
+                    "power_law_exponent",
+                    "Esponente power law",
+                ),
+            )
+
+            validate_turbine_parameters(params)
+
+        except (ValueError, IndexError) as exc:
+            messagebox.showerror(
+                "Impostazioni non valide",
+                str(exc),
+                parent=dialog,
+            )
+            return
+
+        result["year"] = selected_year
+        result["params"] = params
+        result["interpolate"] = bool(interpolate_var.get())
+
+        dialog.destroy()
+
+    def cancel():
+        dialog.destroy()
+
+    button_frame = ttk.Frame(outer)
+
+    button_frame.grid(
+        row=note_row + 3,
+        column=0,
+        columnspan=3,
+        pady=(14, 0),
+        sticky="e",
+    )
+
+    ttk.Button(
+        button_frame,
+        text="Annulla",
+        command=cancel,
+    ).pack(side="right", padx=(8, 0))
+
+    ttk.Button(
+        button_frame,
+        text="Avvia analisi",
+        command=accept,
+    ).pack(side="right")
+
+    dialog.protocol("WM_DELETE_WINDOW", cancel)
+    dialog.bind("<Escape>", lambda _event: cancel())
+
+    dialog.update_idletasks()
+
+    x = (dialog.winfo_screenwidth() - dialog.winfo_reqwidth()) // 2
+    y = (dialog.winfo_screenheight() - dialog.winfo_reqheight()) // 2
+
+    dialog.geometry(f"+{x}+{y}")
+    dialog.lift()
+    dialog.focus_force()
+    year_combo.focus_set()
+    dialog.mainloop()
+
+    if result["year"] is None or result["params"] is None:
+        raise SystemExit("Analisi annullata.")
+
+    return (
+        int(result["year"]),
+        result["params"],  # type: ignore[arg-type]
+        bool(result["interpolate"]),
+    )
+
+
+# =============================================================================
+# VALIDATION
+# =============================================================================
+
+def validate_turbine_parameters(params: TurbineParameters) -> None:
+    if params.rated_power_kw <= 0:
+        raise ValueError("La potenza nominale deve essere positiva.")
+
+    if params.peak_power_kw <= 0:
+        raise ValueError("La potenza di picco deve essere positiva.")
+
+    if params.reference_height_m <= 0:
+        raise ValueError("L'altezza di riferimento deve essere positiva.")
+
+    if params.turbine_height_m <= 0:
+        raise ValueError("L'altezza della turbina deve essere positiva.")
+
+    if params.power_law_exponent < 0:
+        raise ValueError(
+            "L'esponente della power law non può essere negativo."
+        )
+
+    if not (
+        0
+        <= params.cut_in_speed
+        < params.rated_speed
+        < params.cut_out_speed
+    ):
+        raise ValueError(
+            "Deve valere: 0 ≤ cut-in < velocità nominale < cut-out."
+        )
+
+    if params.survival_speed < params.cut_out_speed:
+        raise ValueError(
+            "La velocità di sopravvivenza non può essere inferiore al cut-out."
+        )
+
+
+# =============================================================================
+# INPUT FILE
+# =============================================================================
+
+def _detect_csv_separator(path: Path) -> str:
+    with path.open(
+        "r",
+        encoding="utf-8-sig",
+        errors="replace",
+        newline="",
+    ) as handle:
+        sample = handle.read(32_768)
+
+    try:
+        dialect = csv.Sniffer().sniff(
+            sample,
+            delimiters=",;\t|",
+        )
+        return dialect.delimiter
+    except csv.Error:
+        return ";"
+
+
+def _normalize_column_names(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    df.columns = (
+        df.columns
+        .astype(str)
+        .str.replace("\ufeff", "", regex=False)
+        .str.strip()
+    )
+
+    return df
+
+
+def read_input_table(path: Path) -> pd.DataFrame:
+    suffix = path.suffix.lower()
+
+    if suffix == ".csv":
+        separator = _detect_csv_separator(path)
+
+        print(
+            f"Separatore CSV rilevato: {separator!r}",
+            flush=True,
+        )
+
+        try:
+            df = pd.read_csv(
+                path,
+                sep=separator,
+                engine="c",
+                low_memory=False,
+            )
+        except Exception:
+            df = pd.read_csv(
+                path,
+                sep=separator,
+                engine="python",
+                low_memory=False,
+            )
+
+    elif suffix == ".xlsx":
+        df = pd.read_excel(
+            path,
+            sheet_name=0,
+        )
+
+    elif suffix == ".xls":
+        try:
+            df = pd.read_excel(
+                path,
+                sheet_name=0,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "Per leggere file .xls è necessario installare xlrd:\n"
+                "pip install xlrd"
+            ) from exc
+
+    else:
+        raise ValueError(
+            f"Tipo di file non supportato: '{suffix}'. "
+            "Usa CSV, XLSX o XLS."
+        )
+
+    df = _normalize_column_names(df)
+
+    print(
+        f"Tabella letta: {df.shape[0]} righe, "
+        f"{df.shape[1]} colonne.",
+        flush=True,
+    )
+
+    print(
+        "Colonne trovate:",
+        list(df.columns),
+        flush=True,
+    )
+
+    if df.empty:
+        raise ValueError("Il file è vuoto.")
+
+    return df
+
+
+def choose_column(
+    df: pd.DataFrame,
+    default_name: str,
+    description: str,
+) -> str:
+    if default_name in df.columns:
+        return default_name
+
+    columns = [str(column) for column in df.columns]
+
+    if not columns:
+        raise ValueError(
+            "Il file non contiene colonne leggibili."
+        )
+
+    return choose_from_list_dialog(
+        title="Selezione colonna",
+        message=(
+            f"La colonna predefinita '{default_name}' "
+            "non è stata trovata.\n"
+            f"Seleziona la colonna per {description}."
+        ),
+        values=columns,
+        default=columns[0],
+    )
+
+
+def parse_datetime_column(series: pd.Series) -> pd.Series:
+    raw = series.astype(str).str.strip()
+
+    parsed = pd.to_datetime(
+        raw,
+        format="%d.%m.%Y %H:%M",
+        errors="coerce",
+    )
+
+    missing = parsed.isna() & raw.ne("")
+
+    if missing.any():
+        parsed.loc[missing] = pd.to_datetime(
+            raw.loc[missing],
+            dayfirst=True,
+            errors="coerce",
+        )
+
+    missing = parsed.isna() & raw.ne("")
+
+    if missing.any():
+        parsed.loc[missing] = pd.to_datetime(
+            raw.loc[missing],
+            errors="coerce",
+        )
+
+    return parsed
+
+
+def prepare_source_data(
+    path: Path,
+) -> tuple[pd.DataFrame, str, str]:
+    print("Lettura del file meteorologico...", flush=True)
+
+    df = read_input_table(path)
+
+    time_column = choose_column(
+        df,
+        DEFAULT_TIME_COLUMN,
+        "la data e l'ora",
+    )
+
+    wind_column = choose_column(
+        df,
+        DEFAULT_WIND_COLUMN,
+        "la velocità del vento",
+    )
+
+    data = df[[time_column, wind_column]].copy()
+
+    print(
+        f"Colonna temporale selezionata: {time_column}",
+        flush=True,
+    )
+
+    print(
+        f"Colonna vento selezionata: {wind_column}",
+        flush=True,
+    )
+
+    print(
+        "Conversione delle date...",
+        flush=True,
+    )
+
+    data["timestamp"] = parse_datetime_column(
+        data[time_column]
+    )
+
+    data["wind_speed"] = (
+        data[wind_column]
+        .astype(str)
+        .str.strip()
+        .str.replace(",", ".", regex=False)
+        .str.replace(";", ".", regex=False)
+    )
+
+    data["wind_speed"] = pd.to_numeric(
+        data["wind_speed"],
+        errors="coerce",
+    )
+
+    invalid_time_rows = int(
+        data["timestamp"].isna().sum()
+    )
+
+    invalid_wind_rows = int(
+        data["wind_speed"].isna().sum()
+    )
+
+    print(
+        f"Date non valide: {invalid_time_rows}",
+        flush=True,
+    )
+
+    print(
+        f"Velocità non valide: {invalid_wind_rows}",
+        flush=True,
+    )
+
+    data = data.dropna(
+        subset=["timestamp"]
+    ).copy()
+
+    data["timestamp"] = data["timestamp"].dt.floor("h")
+
+    data.loc[
+        data["wind_speed"] < 0,
+        "wind_speed",
+    ] = np.nan
+
+    print(
+        "Aggregazione dei dati alla frequenza oraria...",
+        flush=True,
+    )
+
+    data = (
+        data.groupby(
+            "timestamp",
+            as_index=False,
+        )["wind_speed"]
+        .mean()
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+
+    if data.empty:
+        raise ValueError(
+            "Dopo la conversione non sono rimasti dati validi."
+        )
+
+    print(
+        f"Dati orari disponibili: {len(data)} righe.",
+        flush=True,
+    )
+
+    print(
+        f"Intervallo temporale: "
+        f"{data['timestamp'].min()} - "
+        f"{data['timestamp'].max()}",
+        flush=True,
+    )
+
+    return data, time_column, wind_column
+
+
+# =============================================================================
+# YEAR SELECTION AND DATA QUALITY
+# =============================================================================
+
+def full_hourly_index(year: int) -> pd.DatetimeIndex:
+    return pd.date_range(
+        start=f"{year}-01-01 00:00:00",
+        end=f"{year}-12-31 23:00:00",
+        freq="h",
+    )
+
+
+def get_year_information(
+    data: pd.DataFrame,
+) -> tuple[list[int], dict[int, int], dict[int, int]]:
+    available_years = sorted(
+        data["timestamp"].dt.year.dropna().unique().astype(int)
+    )
+
+    if not available_years:
+        raise ValueError(
+            "Non è stato possibile identificare nessun anno."
+        )
+
+    year_counts: dict[int, int] = {}
+    missing_years: dict[int, int] = {}
+
+    for year in available_years:
+        year_counts[year] = int(
+            (data["timestamp"].dt.year == year).sum()
+        )
+
+        expected_index = full_hourly_index(year)
+
+        year_timestamps = data.loc[
+            data["timestamp"].dt.year == year,
+            "timestamp",
+        ]
+
+        valid_timestamps = year_timestamps[
+            year_timestamps.isin(expected_index)
+        ]
+
+        unique_valid_timestamps = valid_timestamps.unique()
+
+        missing_years[year] = int(
+            len(expected_index) - len(unique_valid_timestamps)
+        )
+
+    print(
+        "Righe disponibili per anno:",
+        year_counts,
+        flush=True,
+    )
+
+    print(
+        "Ore mancanti per anno:",
+        missing_years,
+        flush=True,
+    )
+
+    return available_years, year_counts, missing_years
+
+
+def longest_missing_run(series: pd.Series) -> int:
+    missing = series.isna().to_numpy()
+
+    if not missing.any():
+        return 0
+
+    padded = np.concatenate(
+        ([False], missing, [False])
+    )
+
+    changes = np.flatnonzero(
+        padded[1:] != padded[:-1]
+    )
+
+    lengths = changes[1::2] - changes[::2]
+
+    return int(lengths.max()) if len(lengths) else 0
+
+
+def create_complete_year_profile(
+    data: pd.DataFrame,
+    year: int,
+    interpolate_missing: bool,
+) -> tuple[pd.Series, dict]:
+    year_data = data[
+        data["timestamp"].dt.year == year
+    ].copy()
+
+    if year_data.empty:
+        raise ValueError(
+            f"Nessun dato trovato per il {year}."
+        )
+
+    source = (
+        year_data
+        .set_index("timestamp")["wind_speed"]
+        .sort_index()
+    )
+
+    index = full_hourly_index(year)
+
+    profile = source.reindex(index)
+
+    negative_count = int(
+        (profile < 0).sum()
+    )
+
+    profile = profile.mask(profile < 0)
+
+    missing_before = int(
+        profile.isna().sum()
+    )
+
+    max_gap = longest_missing_run(profile)
+
+    quality = {
+        "year": year,
+        "expected_hours": len(index),
+        "source_rows_for_year": len(year_data),
+        "source_valid_wind_values": int(source.notna().sum()),
+        "negative_values_rejected": negative_count,
+        "missing_values_before_fill": missing_before,
+        "longest_missing_run_hours": max_gap,
+        "interpolation_used": False,
+    }
+
+    print(
+        f"Anno {year}: {missing_before} ore mancanti.",
+        flush=True,
+    )
+
+    if missing_before > 0:
+        if not interpolate_missing:
+            raise ValueError(
+                f"Il profilo contiene {missing_before} ore mancanti. "
+                "Seleziona l'interpolazione per continuare."
+            )
+
+        print(
+            "Interpolazione lineare dei valori mancanti...",
+            flush=True,
+        )
+
+        profile = profile.interpolate(
+            method="time",
+            limit_direction="both",
+        )
+
+        quality["interpolation_used"] = True
+
+    if profile.isna().any():
+        raise ValueError(
+            "Restano valori mancanti dopo l'interpolazione."
+        )
+
+    return profile.astype(float), quality
+
+
+# =============================================================================
+# WIND MODEL
+# =============================================================================
+
+def calculate_profile(
+    reference_profile: pd.Series,
+    params: TurbineParameters,
+) -> pd.DataFrame:
+    print(
+        "Calcolo del profilo di potenza...",
+        flush=True,
+    )
+
+    reference_speed = reference_profile.to_numpy(
+        dtype=float
+    )
+
+    height_factor = (
+        params.turbine_height_m
+        / params.reference_height_m
+    ) ** params.power_law_exponent
+
+    turbine_speed = reference_speed * height_factor
+
+    capacity_factor = np.zeros_like(
+        turbine_speed,
+        dtype=float,
+    )
+
+    cubic_region = (
+        (turbine_speed >= params.cut_in_speed)
+        & (turbine_speed < params.rated_speed)
+    )
+
+    denominator = (
+        params.rated_speed ** 3
+        - params.cut_in_speed ** 3
+    )
+
+    capacity_factor[cubic_region] = (
+        turbine_speed[cubic_region] ** 3
+        - params.cut_in_speed ** 3
+    ) / denominator
+
+    rated_region = (
+        (turbine_speed >= params.rated_speed)
+        & (turbine_speed < params.cut_out_speed)
+    )
+
+    capacity_factor[rated_region] = 1.0
+
+    above_cutout = (
+        turbine_speed >= params.cut_out_speed
+    )
+
+    capacity_factor[above_cutout] = 0.0
+
+    capacity_factor = np.clip(
+        capacity_factor,
+        0.0,
+        1.0,
+    )
+
+    power_kw = (
+        capacity_factor
+        * params.rated_power_kw
+    )
+
+    return pd.DataFrame(
+        {
+            "timestamp": reference_profile.index,
+            "reference_wind_speed": reference_speed,
+            "turbine_wind_speed": turbine_speed,
+            "capacity_factor": capacity_factor,
+            "turbine_power_kw": power_kw,
+        }
+    )
+
+
+# =============================================================================
+# EXCEL OUTPUT
+# =============================================================================
+
+def write_results(
+    path: Path,
+    result_df: pd.DataFrame,
+    params: TurbineParameters,
+    quality: dict,
+    source_file: Path,
+) -> None:
+    print(
+        "Scrittura del file Excel...",
+        flush=True,
+    )
+
+    if path.exists():
+        try:
+            path.unlink()
+        except PermissionError as exc:
+            raise PermissionError(
+                f"Il file '{path}' è già aperto. "
+                "Chiudilo in Excel e riprova."
+            ) from exc
+
+    workbook = Workbook()
+
+    summary = workbook.active
+    summary.title = "Summary"
+
+    hourly = workbook.create_sheet(
+        "Hourly profile"
+    )
+
+    parameters = workbook.create_sheet(
+        "Parameters"
+    )
+
+    data_quality = workbook.create_sheet(
+        "Data quality"
+    )
+
+    dark_blue = "1F4E78"
+    light_green = "E2F0D9"
+    light_yellow = "FFF2CC"
+    white = "FFFFFF"
+
+    # SUMMARY
+
+    summary.merge_cells("A1:E1")
+    summary["A1"] = (
+        f"Wind turbine capacity factor - "
+        f"{params.name}"
+    )
+    summary["A1"].fill = PatternFill(
+        "solid",
+        fgColor=dark_blue,
+    )
+    summary["A1"].font = Font(
+        name="Arial",
+        size=15,
+        bold=True,
+        color=white,
+    )
+    summary["A1"].alignment = Alignment(
+        horizontal="left"
+    )
+
+    headers = [
+        "Month",
+        "Specific production (kWh/kW)",
+        "Mean capacity factor",
+        "Maximum capacity factor",
+        "Energy production (kWh/turbine)",
+    ]
+
+    for column, header in enumerate(headers, start=1):
+        cell = summary.cell(
+            row=3,
+            column=column,
+            value=header,
+        )
+        cell.fill = PatternFill(
+            "solid",
+            fgColor=dark_blue,
+        )
+        cell.font = Font(
+            name="Arial",
+            bold=True,
+            color=white,
+        )
+        cell.alignment = Alignment(
+            horizontal="center",
+            vertical="center",
+        )
+
+    temp = result_df.copy()
+    temp["month"] = temp["timestamp"].dt.month
+
+    month_names = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ]
+
+    grouped = temp.groupby(
+        "month",
+        sort=True,
+    )
+
+    for month in range(1, 13):
+        if month not in grouped.groups:
+            continue
+
+        month_df = grouped.get_group(month)
+
+        values = [
+            month_names[month - 1],
+            float(
+                month_df["capacity_factor"].sum()
+            ),
+            float(
+                month_df["capacity_factor"].mean()
+            ),
+            float(
+                month_df["capacity_factor"].max()
+            ),
+            float(
+                month_df["turbine_power_kw"].sum()
+            ),
+        ]
+
+        row = month + 3
+
+        for column, value in enumerate(values, start=1):
+            summary.cell(
+                row=row,
+                column=column,
+                value=value,
+            )
+
+        summary.cell(row=row, column=2).number_format = "#,##0.0"
+        summary.cell(row=row, column=3).number_format = "0.0000"
+        summary.cell(row=row, column=4).number_format = "0.0000"
+        summary.cell(row=row, column=5).number_format = "#,##0.0"
+
+    total_row = 16
+
+    annual_values = [
+        "Annual total/mean",
+        float(result_df["capacity_factor"].sum()),
+        float(result_df["capacity_factor"].mean()),
+        float(result_df["capacity_factor"].max()),
+        float(result_df["turbine_power_kw"].sum()),
+    ]
+
+    for column, value in enumerate(annual_values, start=1):
+        cell = summary.cell(
+            row=total_row,
+            column=column,
+            value=value,
+        )
+        cell.fill = PatternFill(
+            "solid",
+            fgColor=light_green,
+        )
+        cell.font = Font(
+            name="Arial",
+            bold=True,
+        )
+
+    summary.cell(
+        row=total_row,
+        column=2,
+    ).number_format = "#,##0.0"
+
+    summary.cell(
+        row=total_row,
+        column=3,
+    ).number_format = "0.0000"
+
+    summary.cell(
+        row=total_row,
+        column=4,
+    ).number_format = "0.0000"
+
+    summary.cell(
+        row=total_row,
+        column=5,
+    ).number_format = "#,##0.0"
+
+    summary.column_dimensions["A"].width = 24
+    summary.column_dimensions["B"].width = 30
+    summary.column_dimensions["C"].width = 23
+    summary.column_dimensions["D"].width = 25
+    summary.column_dimensions["E"].width = 30
+
+    # HOURLY PROFILE
+
+    hourly_headers = [
+        "Date and time",
+        "Wind speed at reference height (m/s)",
+        "Wind speed at turbine height (m/s)",
+        "Capacity factor (-)",
+        "Turbine power (kW)",
+    ]
+
+    hourly.append(hourly_headers)
+
+    for row in result_df.itertuples(index=False):
+        hourly.append(
+            [
+                row.timestamp.to_pydatetime(),
+                float(row.reference_wind_speed),
+                float(row.turbine_wind_speed),
+                float(row.capacity_factor),
+                float(row.turbine_power_kw),
+            ]
+        )
+
+    for cell in hourly[1]:
+        cell.fill = PatternFill(
+            "solid",
+            fgColor=dark_blue,
+        )
+        cell.font = Font(
+            name="Arial",
+            bold=True,
+            color=white,
+        )
+        cell.alignment = Alignment(
+            horizontal="center",
+            vertical="center",
+        )
+
+    hourly.freeze_panes = "A2"
+    hourly.auto_filter.ref = (
+        f"A1:E{hourly.max_row}"
+    )
+
+    hourly.column_dimensions["A"].width = 20
+    hourly.column_dimensions["B"].width = 38
+    hourly.column_dimensions["C"].width = 36
+    hourly.column_dimensions["D"].width = 21
+    hourly.column_dimensions["E"].width = 22
+
+    for row_index in range(
+        2,
+        hourly.max_row + 1,
+    ):
+        hourly.cell(
+            row_index,
+            1,
+        ).number_format = "yyyy-mm-dd hh:mm"
+
+        hourly.cell(
+            row_index,
+            2,
+        ).number_format = "0.00"
+
+        hourly.cell(
+            row_index,
+            3,
+        ).number_format = "0.00"
+
+        hourly.cell(
+            row_index,
+            4,
+        ).number_format = "0.0000"
+
+        hourly.cell(
+            row_index,
+            5,
+        ).number_format = "0.000"
+
+    # PARAMETERS
+
+    parameter_rows = [
+        ("Source file", str(source_file)),
+        ("Turbine name", params.name),
+        ("Rated power [kW]", params.rated_power_kw),
+        (
+            "Peak power [kW] - metadata only",
+            params.peak_power_kw,
+        ),
+        ("Cut-in speed [m/s]", params.cut_in_speed),
+        ("Rated speed [m/s]", params.rated_speed),
+        (
+            "Cut-out speed [m/s] - modelling assumption",
+            params.cut_out_speed,
+        ),
+        (
+            "Survival speed [m/s] - metadata only",
+            params.survival_speed,
+        ),
+        (
+            "Reference wind height [m]",
+            params.reference_height_m,
+        ),
+        (
+            "Turbine height [m]",
+            params.turbine_height_m,
+        ),
+        (
+            "Power-law exponent [-]",
+            params.power_law_exponent,
+        ),
+        (
+            "Power curve model",
+            "Generic piecewise cubic curve",
+        ),
+        (
+            "Peak-power treatment",
+            "Power capped at rated power",
+        ),
+    ]
+
+    parameters.append(["Parameter", "Value"])
+
+    for item in parameter_rows:
+        parameters.append(list(item))
+
+    for cell in parameters[1]:
+        cell.fill = PatternFill(
+            "solid",
+            fgColor=dark_blue,
+        )
+        cell.font = Font(
+            name="Arial",
+            bold=True,
+            color=white,
+        )
+
+    parameters.column_dimensions["A"].width = 48
+    parameters.column_dimensions["B"].width = 75
+
+    for row_index in range(
+        2,
+        parameters.max_row + 1,
+    ):
+        text = str(
+            parameters.cell(
+                row_index,
+                1,
+            ).value
+        )
+
+        if (
+            "assumption" in text.lower()
+            or "peak-power" in text.lower()
+        ):
+            parameters.cell(
+                row_index,
+                1,
+            ).fill = PatternFill(
+                "solid",
+                fgColor=light_yellow,
+            )
+
+            parameters.cell(
+                row_index,
+                2,
+            ).fill = PatternFill(
+                "solid",
+                fgColor=light_yellow,
+            )
+
+    # DATA QUALITY
+
+    data_quality.append(["Item", "Value"])
+
+    quality_rows = [
+        ("Analysed year", quality["year"]),
+        (
+            "Expected hourly records",
+            quality["expected_hours"],
+        ),
+        (
+            "Source rows for selected year",
+            quality["source_rows_for_year"],
+        ),
+        (
+            "Source valid wind values",
+            quality["source_valid_wind_values"],
+        ),
+        (
+            "Negative wind values rejected",
+            quality["negative_values_rejected"],
+        ),
+        (
+            "Missing/invalid hours before filling",
+            quality["missing_values_before_fill"],
+        ),
+        (
+            "Longest consecutive missing gap [h]",
+            quality["longest_missing_run_hours"],
+        ),
+        (
+            "Interpolation used",
+            "YES" if quality["interpolation_used"] else "NO",
+        ),
+    ]
+
+    for item in quality_rows:
+        data_quality.append(list(item))
+
+    for cell in data_quality[1]:
+        cell.fill = PatternFill(
+            "solid",
+            fgColor=dark_blue,
+        )
+        cell.font = Font(
+            name="Arial",
+            bold=True,
+            color=white,
+        )
+
+    data_quality.column_dimensions["A"].width = 45
+    data_quality.column_dimensions["B"].width = 30
+
+    if quality["interpolation_used"]:
+        for row_index in range(
+            2,
+            data_quality.max_row + 1,
+        ):
+            data_quality.cell(
+                row_index,
+                1,
+            ).fill = PatternFill(
+                "solid",
+                fgColor=light_yellow,
+            )
+
+            data_quality.cell(
+                row_index,
+                2,
+            ).fill = PatternFill(
+                "solid",
+                fgColor=light_yellow,
+            )
+
+    workbook.properties.title = (
+        "Hourly wind turbine capacity factor"
+    )
+
+    workbook.properties.subject = (
+        "Normalized wind turbine production"
+    )
+
+    workbook.save(path)
+
+    print(
+        f"File Excel salvato correttamente: {path}",
+        flush=True,
+    )
+
+
+# =============================================================================
+# PLOT
+# =============================================================================
+
+def plot_capacity_factor(
+    result_df: pd.DataFrame,
+    params: TurbineParameters,
+    year: int,
+) -> None:
+    figure, axis = plt.subplots(
+        figsize=(13, 5)
+    )
+
+    axis.plot(
+        result_df["timestamp"],
+        result_df["capacity_factor"],
+        linewidth=0.7,
+    )
+
+    axis.set_title(
+        f"Hourly wind turbine capacity factor - "
+        f"{params.name} - {year}"
+    )
+
+    axis.set_xlabel("Month")
+    axis.set_ylabel("Capacity factor [-]")
+    axis.set_ylim(0.0, 1.05)
+
+    axis.xaxis.set_major_locator(
+        mdates.MonthLocator()
+    )
+
+    axis.xaxis.set_major_formatter(
+        mdates.DateFormatter("%b")
+    )
+
+    axis.grid(
+        True,
+        linewidth=0.6,
+    )
+
+    figure.tight_layout()
+    plt.show()
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main(show_plot: bool = True) -> None:
+    print("=" * 78, flush=True)
+    print(
+        "WIND CAPACITY FACTOR CALCULATOR",
+        flush=True,
+    )
+    print("=" * 78, flush=True)
+
+    print(
+        "1. Seleziona il file meteorologico...",
+        flush=True,
+    )
+
+    input_path = select_input_file()
+
+    print(
+        f"File selezionato: {input_path}",
+        flush=True,
+    )
+
+    print(
+        "2. Lettura e preparazione dei dati...",
+        flush=True,
+    )
+
+    data, time_column, wind_column = prepare_source_data(
+        input_path
+    )
+
+    print(
+        f"Colonna temporale: {time_column}",
+        flush=True,
+    )
+
+    print(
+        f"Colonna vento: {wind_column}",
+        flush=True,
+    )
+
+    print(
+        "3. Identificazione degli anni...",
+        flush=True,
+    )
+
+    candidate_years, year_counts, missing_years = (
+        get_year_information(data)
+    )
+
+    print(
+        f"Anni disponibili: {candidate_years}",
+        flush=True,
+    )
+
+    print(
+        "4. Apertura delle impostazioni...",
+        flush=True,
+    )
+
+    year, params, interpolate_missing = ask_analysis_setup(
+        candidate_years,
+        year_counts,
+        missing_years,
+    )
+
+    print(
+        f"Anno selezionato: {year}",
+        flush=True,
+    )
+
+    print(
+        f"Interpolazione attiva: {interpolate_missing}",
+        flush=True,
+    )
+
+    expected_hours = (
+        8784 if calendar.isleap(year) else 8760
+    )
+
+    print(
+        f"Ore attese: {expected_hours}",
+        flush=True,
+    )
+
+    print(
+        "5. Creazione del profilo orario...",
+        flush=True,
+    )
+
+    reference_profile, quality = (
+        create_complete_year_profile(
+            data,
+            year,
+            interpolate_missing,
+        )
+    )
+
+    print(
+        "Profilo orario creato.",
+        flush=True,
+    )
+
+    print(
+        "6. Calcolo della produzione...",
+        flush=True,
+    )
+
+    result_df = calculate_profile(
+        reference_profile,
+        params,
+    )
+
+    safe_turbine_name = "".join(
+        char
+        if char.isalnum() or char in {"-", "_"}
+        else "_"
+        for char in params.name
+    )
+
+    default_output_name = (
+        f"Wind_capacity_factor_"
+        f"{safe_turbine_name}_{year}.xlsx"
+    )
+
+    print(
+        "7. Seleziona il file di output...",
+        flush=True,
+    )
+
+    output_path = select_output_file(
+        input_path.parent,
+        default_output_name,
+    )
+
+    print(
+        f"Percorso di output: {output_path}",
+        flush=True,
+    )
+
+    print(
+        "8. Scrittura del file Excel...",
+        flush=True,
+    )
+
+    write_results(
+        output_path,
+        result_df,
+        params,
+        quality,
+        input_path,
+    )
+
+    annual_specific_production = float(
+        result_df["capacity_factor"].sum()
+    )
+
+    annual_capacity_factor = float(
+        result_df["capacity_factor"].mean()
+    )
+
+    annual_energy_kwh = float(
+        result_df["turbine_power_kw"].sum()
+    )
+
+    cut_out_hours = int(
+        (
+            result_df["turbine_wind_speed"]
+            >= params.cut_out_speed
+        ).sum()
+    )
+
+    rated_region_hours = int(
+        (
+            result_df["turbine_wind_speed"]
+            >= params.rated_speed
+        ).sum()
+    )
+
+    print("\n" + "=" * 78, flush=True)
+    print("RISULTATI", flush=True)
+    print("=" * 78, flush=True)
+
+    print(
+        f"Creato: {output_path}",
+        flush=True,
+    )
+
+    print(
+        f"Anno analizzato: {year}",
+        flush=True,
+    )
+
+    print(
+        f"Ore processate: {len(result_df)}",
+        flush=True,
+    )
+
+    print(
+        f"Produzione specifica annua: "
+        f"{annual_specific_production:.1f} kWh/kW",
+        flush=True,
+    )
+
+    print(
+        f"Capacity factor medio annuo: "
+        f"{annual_capacity_factor:.4f}",
+        flush=True,
+    )
+
+    print(
+        f"Energia annua per una turbina da "
+        f"{params.rated_power_kw:.3f} kW: "
+        f"{annual_energy_kwh:.1f} kWh",
+        flush=True,
+    )
+
+    print(
+        f"Ore sopra il cut-out: {cut_out_hours}",
+        flush=True,
+    )
+
+    print(
+        f"Ore con v >= velocità nominale: "
+        f"{rated_region_hours}",
+        flush=True,
+    )
+
+    show_info(
+        "Analisi completata",
+        (
+            f"Analisi completata per il {year}.\n\n"
+            f"Capacity factor medio annuo: "
+            f"{annual_capacity_factor:.4f}\n"
+            f"Energia annua: "
+            f"{annual_energy_kwh:.1f} kWh\n\n"
+            f"File salvato in:\n{output_path}"
+        ),
+    )
+
+    if show_plot:
+        plot_capacity_factor(
+            result_df,
+            params,
+            year,
+        )
+
+
+# =============================================================================
+# ERROR HANDLING
+# =============================================================================
+
+if __name__ == "__main__":
+    try:
+        main(show_plot=True)
+
+    except SystemExit:
+        raise
+
+    except Exception as exc:
+        error_message = (
+            f"{type(exc).__name__}: {exc}\n\n"
+            "Controlla anche il terminale per i dettagli."
+        )
+
+        print("\nERRORE:", flush=True)
+        traceback.print_exc()
+
+        try:
+            show_error(
+                "Errore durante l'analisi",
+                error_message,
+            )
+        except Exception:
+            pass
+
+        sys.exit(1)

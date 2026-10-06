@@ -1,0 +1,1105 @@
+"""Optimize fixed-tilt PV design for Hornsund using the existing PV capacity-factor model.
+
+DESIGN VARIABLES OPTIMIZED
+--------------------------
+1) Surface tilt beta [deg]
+2) Surface azimuth gamma [deg]
+
+Azimuth convention is inherited from the Hornsund PV model:
+    0 deg   = South
+   -90 deg  = East
+   +90 deg  = West
+ +/-180 deg = North
+
+OBJECTIVE
+---------
+Maximize annual specific PV production [kWh/kWp]. For a fixed annual number of
+hours this is equivalent to maximizing mean annual capacity factor.
+
+MODEL COUPLING
+--------------
+This optimizer dynamically imports the user's existing Hornsund PV script and
+reuses its:
+- irradiation reader and GHI/DHI/BHI interpretation;
+- 3-hourly -> hourly conversion;
+- SEKLIMA temperature alignment;
+- solar-position convention;
+- 2015 Hornsund/Fuglebekken snow-cover-based rho(t);
+- NOCT temperature correction;
+- derating, clipping, BHI/DNI interpretation and numerical safeguards.
+
+The optimizer does NOT optimize ALBEDO_MIN, ALBEDO_MAX, derating, NOCT,
+temperature coefficient, etc. Those are model/environmental parameters, not PV
+orientation design variables. It reads them from the selected base PV script.
+
+The search uses a coarse grid over the requested ranges, followed by a finer
+local grid around the best coarse point. Results are therefore grid-optimal at
+the selected fine resolution, not an analytical continuous optimum.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import math
+import sys
+from pathlib import Path
+from types import ModuleType
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk, simpledialog
+except ImportError:  # pragma: no cover
+    tk = None
+    filedialog = None
+    messagebox = None
+    ttk = None
+
+
+# -----------------------------------------------------------------------------
+# DEFAULT OPTIMIZATION RANGE
+# -----------------------------------------------------------------------------
+TILT_MIN_DEFAULT = 0.0
+TILT_MAX_DEFAULT = 90.0
+AZIMUTH_MIN_DEFAULT = -180.0
+AZIMUTH_MAX_DEFAULT = 180.0
+COARSE_TILT_STEP_DEFAULT = 5.0
+COARSE_AZIMUTH_STEP_DEFAULT = 5.0
+FINE_STEP_DEFAULT = 0.25
+
+
+# -----------------------------------------------------------------------------
+# FILE / GUI HELPERS
+# -----------------------------------------------------------------------------
+def _make_root():
+    if tk is None:
+        raise RuntimeError("Tkinter is not available.")
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+    return root
+
+
+def choose_python_model_file() -> Path:
+    root = _make_root()
+    selected = filedialog.askopenfilename(
+        parent=root,
+        title="Select the Hornsund PV capacity-factor Python script",
+        filetypes=[("Python files", "*.py"), ("All files", "*.*")],
+    )
+    root.destroy()
+    if not selected:
+        raise SystemExit("PV model selection cancelled.")
+    return Path(selected)
+
+
+def choose_irradiation_file() -> Path:
+    root = _make_root()
+    selected = filedialog.askopenfilename(
+        parent=root,
+        title="Select Hornsund irradiation CSV",
+        filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+    )
+    root.destroy()
+    if not selected:
+        raise SystemExit("Irradiation file selection cancelled.")
+    return Path(selected)
+
+
+def choose_temperature_file() -> Path:
+    root = _make_root()
+    selected = filedialog.askopenfilename(
+        parent=root,
+        title="Select SEKLIMA temperature CSV",
+        filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+    )
+    root.destroy()
+    if not selected:
+        raise SystemExit("Temperature file selection cancelled.")
+    return Path(selected)
+
+
+def choose_output_file(default_name: str) -> Path:
+    root = _make_root()
+    selected = filedialog.asksaveasfilename(
+        parent=root,
+        title="Save PV design optimization results",
+        initialfile=default_name,
+        defaultextension=".xlsx",
+        filetypes=[("Excel workbook", "*.xlsx")],
+    )
+    root.destroy()
+    if not selected:
+        raise SystemExit("Output file selection cancelled.")
+    return Path(selected)
+
+
+def import_pv_model(path: Path) -> ModuleType:
+    spec = importlib.util.spec_from_file_location("hornsund_pv_model", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not import PV model from: {path}")
+    module = importlib.util.module_from_spec(spec)
+    # Register the dynamically imported module before execution. This is needed
+    # by dataclasses and other standard-library features that inspect sys.modules.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    required = [
+        "read_hornsund_csv",
+        "read_temperature_csv",
+        "to_hourly",
+        "attach_temperature",
+        "solar_geometry",
+        "ground_albedo_for_timestamp",
+    ]
+    missing = [name for name in required if not hasattr(module, name)]
+    if missing:
+        raise AttributeError(
+            "The selected PV script is not compatible with this optimizer. "
+            f"Missing functions: {missing}"
+        )
+    return module
+
+
+def ask_optimization_setup(candidate_years: list[int]) -> dict:
+    if not candidate_years:
+        raise ValueError("No common year is available in irradiation and temperature data.")
+
+    dialog = tk.Tk()
+    dialog.title("Hornsund PV design optimization")
+    dialog.resizable(False, False)
+    try:
+        dialog.attributes("-topmost", True)
+    except Exception:
+        pass
+
+    outer = ttk.Frame(dialog, padding=16)
+    outer.grid(row=0, column=0, sticky="nsew")
+
+    ttk.Label(
+        outer,
+        text="Optimize fixed PV orientation",
+        font=("TkDefaultFont", 11, "bold"),
+    ).grid(row=0, column=0, columnspan=3, sticky="w")
+
+    ttk.Label(
+        outer,
+        text=(
+            "Objective: maximize annual specific PV production (kWh/kWp).\n"
+            "Only tilt and azimuth are optimized; the remaining PV-model parameters "
+            "are inherited from the selected capacity-factor script."
+        ),
+        justify="left",
+        wraplength=700,
+    ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 12))
+
+    row = 2
+    ttk.Label(outer, text="Year").grid(row=row, column=0, sticky="w", pady=3)
+    year_var = tk.StringVar(value=str(2015 if 2015 in candidate_years else candidate_years[0]))
+    year_combo = ttk.Combobox(
+        outer,
+        textvariable=year_var,
+        values=[str(y) for y in candidate_years],
+        state="readonly",
+        width=22,
+    )
+    year_combo.grid(row=row, column=1, sticky="ew", padx=(12, 8), pady=3)
+
+    fields = [
+        ("Tilt minimum", "tilt_min", TILT_MIN_DEFAULT, "deg"),
+        ("Tilt maximum", "tilt_max", TILT_MAX_DEFAULT, "deg"),
+        ("Azimuth minimum", "azimuth_min", AZIMUTH_MIN_DEFAULT, "deg"),
+        ("Azimuth maximum", "azimuth_max", AZIMUTH_MAX_DEFAULT, "deg"),
+        ("Coarse tilt step", "coarse_tilt_step", COARSE_TILT_STEP_DEFAULT, "deg"),
+        ("Coarse azimuth step", "coarse_azimuth_step", COARSE_AZIMUTH_STEP_DEFAULT, "deg"),
+        ("Fine refinement step", "fine_step", FINE_STEP_DEFAULT, "deg"),
+    ]
+
+    variables: dict[str, tk.StringVar] = {}
+    for label, key, default, unit in fields:
+        row += 1
+        ttk.Label(outer, text=label).grid(row=row, column=0, sticky="w", pady=3)
+        var = tk.StringVar(value=str(default))
+        variables[key] = var
+        ttk.Entry(outer, textvariable=var, width=22).grid(
+            row=row, column=1, sticky="ew", padx=(12, 8), pady=3
+        )
+        ttk.Label(outer, text=unit).grid(row=row, column=2, sticky="w", pady=3)
+
+    row += 1
+    ttk.Label(
+        outer,
+        text=(
+            "Azimuth convention: 0° = South, -90° = East, +90° = West.\n"
+            "The fine search is automatically centered around the best coarse solution."
+        ),
+        justify="left",
+        wraplength=700,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(10, 4))
+
+    result: dict[str, object] = {"accepted": False}
+
+    def parse_float(key: str, label: str) -> float:
+        raw = variables[key].get().strip().replace(",", ".")
+        try:
+            return float(raw)
+        except ValueError as exc:
+            raise ValueError(f"{label} must be numeric.") from exc
+
+    def accept():
+        try:
+            settings = {
+                "year": int(year_var.get()),
+                "tilt_min": parse_float("tilt_min", "Tilt minimum"),
+                "tilt_max": parse_float("tilt_max", "Tilt maximum"),
+                "azimuth_min": parse_float("azimuth_min", "Azimuth minimum"),
+                "azimuth_max": parse_float("azimuth_max", "Azimuth maximum"),
+                "coarse_tilt_step": parse_float("coarse_tilt_step", "Coarse tilt step"),
+                "coarse_azimuth_step": parse_float("coarse_azimuth_step", "Coarse azimuth step"),
+                "fine_step": parse_float("fine_step", "Fine refinement step"),
+            }
+
+            if not 0.0 <= settings["tilt_min"] <= 90.0:
+                raise ValueError("Tilt minimum must be between 0 and 90°.")
+            if not 0.0 <= settings["tilt_max"] <= 90.0:
+                raise ValueError("Tilt maximum must be between 0 and 90°.")
+            if settings["tilt_min"] > settings["tilt_max"]:
+                raise ValueError("Tilt minimum cannot exceed tilt maximum.")
+            if not -180.0 <= settings["azimuth_min"] <= 180.0:
+                raise ValueError("Azimuth minimum must be between -180 and +180°.")
+            if not -180.0 <= settings["azimuth_max"] <= 180.0:
+                raise ValueError("Azimuth maximum must be between -180 and +180°.")
+            if settings["azimuth_min"] > settings["azimuth_max"]:
+                raise ValueError("Azimuth minimum cannot exceed azimuth maximum.")
+            if settings["coarse_tilt_step"] <= 0.0:
+                raise ValueError("Coarse tilt step must be positive.")
+            if settings["coarse_azimuth_step"] <= 0.0:
+                raise ValueError("Coarse azimuth step must be positive.")
+            if settings["fine_step"] <= 0.0:
+                raise ValueError("Fine refinement step must be positive.")
+
+        except ValueError as exc:
+            messagebox.showerror("Invalid settings", str(exc), parent=dialog)
+            return
+
+        result.update(settings)
+        result["accepted"] = True
+        dialog.destroy()
+
+    def cancel():
+        dialog.destroy()
+
+    row += 1
+    buttons = ttk.Frame(outer)
+    buttons.grid(row=row, column=0, columnspan=3, sticky="e", pady=(12, 0))
+    ttk.Button(buttons, text="Cancel", command=cancel).pack(side="right", padx=(8, 0))
+    ttk.Button(buttons, text="Run optimization", command=accept).pack(side="right")
+
+    dialog.protocol("WM_DELETE_WINDOW", cancel)
+    dialog.bind("<Escape>", lambda _event: cancel())
+    dialog.update_idletasks()
+    x = (dialog.winfo_screenwidth() - dialog.winfo_reqwidth()) // 2
+    y = (dialog.winfo_screenheight() - dialog.winfo_reqheight()) // 2
+    dialog.geometry(f"+{x}+{y}")
+    dialog.mainloop()
+
+    if not result.get("accepted"):
+        raise SystemExit("Optimization cancelled.")
+
+    return result
+
+
+# -----------------------------------------------------------------------------
+# PRECOMPUTATION OF QUANTITIES INDEPENDENT OF TILT/AZIMUTH
+# -----------------------------------------------------------------------------
+def prepare_hourly_model_data(
+    model: ModuleType,
+    site,
+    hourly: pd.DataFrame,
+) -> dict[str, np.ndarray | pd.DatetimeIndex]:
+    timestamps = pd.DatetimeIndex(hourly["timestamp"])
+
+    ghi = hourly["ghi"].to_numpy(dtype=float)
+    dhi = hourly["dhi"].to_numpy(dtype=float)
+    source_direct = hourly["bhi"].to_numpy(dtype=float)
+    tair = hourly["air_temperature_C"].to_numpy(dtype=float)
+
+    # Solar zenith/elevation/azimuth do not depend on module orientation.
+    old_tilt = float(model.SURFACE_TILT)
+    old_azimuth = float(model.SURFACE_AZIMUTH)
+    model.SURFACE_TILT = 0.0
+    model.SURFACE_AZIMUTH = 0.0
+
+    cos_zenith = np.empty(len(timestamps), dtype=float)
+    sin_zenith = np.empty(len(timestamps), dtype=float)
+    elevation_deg = np.empty(len(timestamps), dtype=float)
+    solar_azimuth_rad = np.empty(len(timestamps), dtype=float)
+
+    try:
+        for i, ts in enumerate(timestamps):
+            geometry = model.solar_geometry(ts, site)
+            cos_zenith[i] = geometry.cos_zenith
+            zenith_rad = math.radians(geometry.zenith_deg)
+            sin_zenith[i] = max(0.0, math.sin(zenith_rad))
+            elevation_deg[i] = geometry.elevation_deg
+            solar_azimuth_rad[i] = math.radians(geometry.azimuth_deg)
+    finally:
+        model.SURFACE_TILT = old_tilt
+        model.SURFACE_AZIMUTH = old_azimuth
+
+    # Ground albedo rho(t) is independent of PV orientation in the base model.
+    ground_albedo = np.empty(len(timestamps), dtype=float)
+    snow_cover_fraction = np.empty(len(timestamps), dtype=float)
+    for i, ts in enumerate(timestamps):
+        rho, snow_fraction = model.ground_albedo_for_timestamp(ts)
+        ground_albedo[i] = rho
+        snow_cover_fraction[i] = snow_fraction
+
+    direct_type = str(model.DIRECT_INPUT_TYPE).upper()
+    if direct_type == "BHI":
+        derived_dni = np.zeros(len(timestamps), dtype=float)
+        valid = (
+            (elevation_deg >= float(model.MIN_SOLAR_ELEVATION_DEG))
+            & (cos_zenith > 0.0)
+            & (source_direct > 0.0)
+        )
+        derived_dni[valid] = source_direct[valid] / cos_zenith[valid]
+        direct_sun_mask = valid
+    elif direct_type == "DNI":
+        derived_dni = source_direct.copy()
+        direct_sun_mask = elevation_deg > 0.0
+    else:
+        raise ValueError('DIRECT_INPUT_TYPE in the base model must be "BHI" or "DNI".')
+
+    return {
+        "timestamps": timestamps,
+        "ghi": ghi,
+        "dhi": dhi,
+        "source_direct": source_direct,
+        "derived_dni": derived_dni,
+        "direct_sun_mask": direct_sun_mask,
+        "tair": tair,
+        "cos_zenith": cos_zenith,
+        "sin_zenith": sin_zenith,
+        "solar_azimuth_rad": solar_azimuth_rad,
+        "ground_albedo": ground_albedo,
+        "snow_cover_fraction": snow_cover_fraction,
+    }
+
+
+# -----------------------------------------------------------------------------
+# FAST ORIENTATION EVALUATION USING THE SAME EQUATIONS AS THE BASE MODEL
+# -----------------------------------------------------------------------------
+def evaluate_orientation(
+    model: ModuleType,
+    data: dict,
+    tilt_deg: float,
+    azimuth_deg: float,
+    return_hourly: bool = False,
+):
+    beta = math.radians(float(tilt_deg))
+    gamma = math.radians(float(azimuth_deg))
+
+    cos_beta = math.cos(beta)
+    sin_beta = math.sin(beta)
+
+    cos_incidence = (
+        cos_beta * data["cos_zenith"]
+        + sin_beta
+        * data["sin_zenith"]
+        * np.cos(data["solar_azimuth_rad"] - gamma)
+    )
+    cos_incidence = np.clip(cos_incidence, -1.0, 1.0)
+
+    poa_direct = np.zeros_like(data["ghi"], dtype=float)
+    direct_mask = data["direct_sun_mask"] & (cos_incidence > 0.0)
+    poa_direct[direct_mask] = (
+        data["derived_dni"][direct_mask] * cos_incidence[direct_mask]
+    )
+
+    sky_view_factor = (1.0 + cos_beta) / 2.0
+    ground_view_factor = (1.0 - cos_beta) / 2.0
+
+    poa_diffuse = data["dhi"] * sky_view_factor
+    poa_reflected = data["ghi"] * data["ground_albedo"] * ground_view_factor
+    poa_global = np.maximum(0.0, poa_direct + poa_diffuse + poa_reflected)
+
+    if bool(model.USE_TEMPERATURE_CORRECTION):
+        cell_temperature = data["tair"] + (
+            (float(model.NOCT) - float(model.NOCT_REFERENCE_AMBIENT_TEMPERATURE))
+            / float(model.NOCT_REFERENCE_IRRADIANCE)
+        ) * poa_global
+        temperature_factor = 1.0 + float(model.TEMPERATURE_COEFFICIENT) * (
+            cell_temperature - float(model.REFERENCE_CELL_TEMPERATURE)
+        )
+        temperature_factor = np.maximum(0.0, temperature_factor)
+    else:
+        cell_temperature = data["tair"].copy()
+        temperature_factor = np.ones_like(poa_global)
+
+    cf = (
+        float(model.DERATING_FACTOR)
+        * poa_global
+        / 1000.0
+        * temperature_factor
+    )
+    cf = np.maximum(0.0, cf)
+    if bool(model.CLIP_AT_RATED_POWER):
+        cf = np.minimum(1.0, cf)
+
+    specific_yield = float(np.sum(cf))
+    mean_cf = float(np.mean(cf))
+    max_cf = float(np.max(cf))
+    mean_poa = float(np.mean(poa_global))
+
+    metrics = {
+        "tilt_deg": float(tilt_deg),
+        "azimuth_deg": float(azimuth_deg),
+        "specific_yield_kWh_per_kWp": specific_yield,
+        "mean_capacity_factor": mean_cf,
+        "max_capacity_factor": max_cf,
+        "mean_poa_Wm2": mean_poa,
+    }
+
+    if not return_hourly:
+        return metrics
+
+    hourly = pd.DataFrame(
+        {
+            "timestamp_utc": data["timestamps"],
+            "ghi_horizontal_Wm2": data["ghi"],
+            "ground_albedo": data["ground_albedo"],
+            "snow_cover_fraction_2015_reference": data["snow_cover_fraction"],
+            "poa_direct_Wm2": poa_direct,
+            "poa_diffuse_Wm2": poa_diffuse,
+            "poa_ground_reflected_Wm2": poa_reflected,
+            "poa_global_Wm2": poa_global,
+            "air_temperature_C": data["tair"],
+            "cell_temperature_C": cell_temperature,
+            "temperature_factor": temperature_factor,
+            "capacity_factor_kW_per_kWp": cf,
+        }
+    )
+    return metrics, hourly
+
+
+def inclusive_grid(start: float, stop: float, step: float) -> np.ndarray:
+    if step <= 0:
+        raise ValueError("Grid step must be positive.")
+    n = int(math.floor((stop - start) / step + 1e-12))
+    values = start + step * np.arange(n + 1, dtype=float)
+    if len(values) == 0 or values[-1] < stop - 1e-9:
+        values = np.append(values, stop)
+    return np.unique(np.round(values, 10))
+
+
+def run_grid_search(
+    model: ModuleType,
+    data: dict,
+    tilts: np.ndarray,
+    azimuths: np.ndarray,
+    stage: str,
+) -> pd.DataFrame:
+    records = []
+    total = len(tilts) * len(azimuths)
+    counter = 0
+
+    print(f"\n{stage.upper()} GRID SEARCH: {len(tilts)} tilts x {len(azimuths)} azimuths = {total} cases")
+    print("-" * 78)
+
+    for tilt in tilts:
+        for azimuth in azimuths:
+            counter += 1
+            metrics = evaluate_orientation(model, data, float(tilt), float(azimuth))
+            metrics["stage"] = stage
+            records.append(metrics)
+
+        if counter % max(1, len(azimuths) * 3) == 0 or counter == total:
+            print(f"  evaluated {counter}/{total}", flush=True)
+
+    frame = pd.DataFrame.from_records(records)
+    frame = frame.sort_values(
+        ["specific_yield_kWh_per_kWp", "mean_capacity_factor"],
+        ascending=[False, False],
+    ).reset_index(drop=True)
+    return frame
+
+
+def optimize_orientation(model: ModuleType, data: dict, settings: dict):
+    coarse_tilts = inclusive_grid(
+        settings["tilt_min"], settings["tilt_max"], settings["coarse_tilt_step"]
+    )
+    coarse_azimuths = inclusive_grid(
+        settings["azimuth_min"], settings["azimuth_max"], settings["coarse_azimuth_step"]
+    )
+
+    coarse = run_grid_search(model, data, coarse_tilts, coarse_azimuths, "coarse")
+    best_coarse = coarse.iloc[0]
+
+    tilt_center = float(best_coarse["tilt_deg"])
+    az_center = float(best_coarse["azimuth_deg"])
+
+    fine_tilt_min = max(settings["tilt_min"], tilt_center - settings["coarse_tilt_step"])
+    fine_tilt_max = min(settings["tilt_max"], tilt_center + settings["coarse_tilt_step"])
+    fine_az_min = max(settings["azimuth_min"], az_center - settings["coarse_azimuth_step"])
+    fine_az_max = min(settings["azimuth_max"], az_center + settings["coarse_azimuth_step"])
+
+    fine_tilts = inclusive_grid(fine_tilt_min, fine_tilt_max, settings["fine_step"])
+    fine_azimuths = inclusive_grid(fine_az_min, fine_az_max, settings["fine_step"])
+
+    fine = run_grid_search(model, data, fine_tilts, fine_azimuths, "fine")
+    best = fine.iloc[0].to_dict()
+
+    all_results = pd.concat([coarse, fine], ignore_index=True)
+    all_results = all_results.drop_duplicates(
+        subset=["tilt_deg", "azimuth_deg"], keep="last"
+    )
+    all_results = all_results.sort_values(
+        ["specific_yield_kWh_per_kWp", "mean_capacity_factor"],
+        ascending=[False, False],
+    ).reset_index(drop=True)
+
+    return best, coarse, fine, all_results
+
+
+
+# -----------------------------------------------------------------------------
+# OPTIONAL FIXED-AZIMUTH / FIXED-TILT ANALYSIS
+# -----------------------------------------------------------------------------
+def ask_fixed_analysis_request() -> tuple[str, float] | None:
+    """Ask whether the user wants an additional 1-D design analysis.
+
+    Returns:
+        ("azimuth", value_deg) to fix azimuth and optimize tilt,
+        ("tilt", value_deg) to fix tilt and optimize azimuth,
+        None when the user does not want another analysis.
+    """
+    root = _make_root()
+    try:
+        continue_analysis = messagebox.askyesno(
+            "Additional PV design analysis",
+            (
+                "Do you want to analyse a specific azimuth or tilt?\n\n"
+                "YES: choose a fixed value and the script will optimize the other angle.\n"
+                "NO: finish the analysis."
+            ),
+            parent=root,
+        )
+    finally:
+        root.destroy()
+
+    if not continue_analysis:
+        return None
+
+    # Ask which variable the user wants to fix.
+    dialog = tk.Tk()
+    dialog.title("Choose fixed design variable")
+    dialog.resizable(False, False)
+    try:
+        dialog.attributes("-topmost", True)
+    except Exception:
+        pass
+
+    result = {"choice": None}
+    frame = ttk.Frame(dialog, padding=16)
+    frame.grid(row=0, column=0, sticky="nsew")
+
+    ttk.Label(
+        frame,
+        text=(
+            "Which value do you want to impose?\n\n"
+            "If you fix the azimuth, the script searches for the best tilt.\n"
+            "If you fix the tilt, the script searches for the best azimuth."
+        ),
+        justify="left",
+        wraplength=520,
+    ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+
+    def choose(value: str):
+        result["choice"] = value
+        dialog.destroy()
+
+    ttk.Button(
+        frame,
+        text="Fix azimuth",
+        command=lambda: choose("azimuth"),
+        width=20,
+    ).grid(row=1, column=0, padx=(0, 6), pady=4)
+
+    ttk.Button(
+        frame,
+        text="Fix tilt",
+        command=lambda: choose("tilt"),
+        width=20,
+    ).grid(row=1, column=1, padx=(6, 0), pady=4)
+
+    ttk.Button(
+        frame,
+        text="Cancel",
+        command=lambda: choose("cancel"),
+        width=20,
+    ).grid(row=2, column=0, columnspan=2, pady=(10, 0))
+
+    dialog.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
+    dialog.update_idletasks()
+    x = (dialog.winfo_screenwidth() - dialog.winfo_reqwidth()) // 2
+    y = (dialog.winfo_screenheight() - dialog.winfo_reqheight()) // 2
+    dialog.geometry(f"+{x}+{y}")
+    dialog.mainloop()
+
+    if result["choice"] in (None, "cancel"):
+        return None
+
+    root = _make_root()
+    try:
+        if result["choice"] == "azimuth":
+            value = simpledialog.askfloat(
+                "Fixed azimuth",
+                (
+                    "Enter the azimuth to analyse [deg].\n"
+                    "Convention: 0° = South, -90° = East, +90° = West, ±180° = North."
+                ),
+                parent=root,
+                minvalue=-180.0,
+                maxvalue=180.0,
+            )
+        else:
+            value = simpledialog.askfloat(
+                "Fixed tilt",
+                "Enter the tilt to analyse [deg].\n0° = horizontal, 90° = vertical.",
+                parent=root,
+                minvalue=0.0,
+                maxvalue=90.0,
+            )
+    finally:
+        root.destroy()
+
+    if value is None:
+        return None
+
+    return str(result["choice"]), float(value)
+
+
+def run_fixed_design_analysis(
+    model: ModuleType,
+    data: dict,
+    settings: dict,
+    fixed_kind: str,
+    fixed_value: float,
+) -> tuple[dict, pd.DataFrame]:
+    """Optimize one angle while keeping the other one fixed.
+
+    The same annual PV model and objective used by the 2-D optimizer are reused.
+    The scan resolution is the selected fine step.
+    """
+    fine_step = float(settings["fine_step"])
+
+    if fixed_kind == "azimuth":
+        if not -180.0 <= fixed_value <= 180.0:
+            raise ValueError("Fixed azimuth must be between -180° and +180°.")
+
+        variable_values = inclusive_grid(
+            float(settings["tilt_min"]),
+            float(settings["tilt_max"]),
+            fine_step,
+        )
+
+        records = [
+            evaluate_orientation(
+                model,
+                data,
+                tilt_deg=float(tilt),
+                azimuth_deg=float(fixed_value),
+            )
+            for tilt in variable_values
+        ]
+
+    elif fixed_kind == "tilt":
+        if not 0.0 <= fixed_value <= 90.0:
+            raise ValueError("Fixed tilt must be between 0° and 90°.")
+
+        variable_values = inclusive_grid(
+            float(settings["azimuth_min"]),
+            float(settings["azimuth_max"]),
+            fine_step,
+        )
+
+        records = [
+            evaluate_orientation(
+                model,
+                data,
+                tilt_deg=float(fixed_value),
+                azimuth_deg=float(azimuth),
+            )
+            for azimuth in variable_values
+        ]
+
+    else:
+        raise ValueError("fixed_kind must be 'azimuth' or 'tilt'.")
+
+    frame = pd.DataFrame.from_records(records)
+    frame = frame.sort_values(
+        ["specific_yield_kWh_per_kWp", "mean_capacity_factor"],
+        ascending=[False, False],
+    ).reset_index(drop=True)
+
+    best = frame.iloc[0].to_dict()
+    return best, frame
+
+
+def show_fixed_analysis_result(fixed_kind: str, fixed_value: float, best: dict) -> None:
+    """Show the result of one fixed-angle analysis."""
+    if fixed_kind == "azimuth":
+        title = "Result - fixed azimuth"
+        body = (
+            f"Fixed azimuth = {fixed_value:.2f}°\n\n"
+            f"Best tilt = {best['tilt_deg']:.2f}°\n"
+            f"Specific yield = {best['specific_yield_kWh_per_kWp']:.2f} kWh/kWp\n"
+            f"Mean CF = {best['mean_capacity_factor']:.5f}\n"
+            f"Mean POA = {best['mean_poa_Wm2']:.2f} W/m²"
+        )
+    else:
+        title = "Result - fixed tilt"
+        body = (
+            f"Fixed tilt = {fixed_value:.2f}°\n\n"
+            f"Best azimuth = {best['azimuth_deg']:.2f}°\n"
+            f"Specific yield = {best['specific_yield_kWh_per_kWp']:.2f} kWh/kWp\n"
+            f"Mean CF = {best['mean_capacity_factor']:.5f}\n"
+            f"Mean POA = {best['mean_poa_Wm2']:.2f} W/m²"
+        )
+
+    print("\n" + "=" * 78)
+    print(title.upper())
+    print("=" * 78)
+    print(body)
+
+    root = _make_root()
+    try:
+        messagebox.showinfo(title, body, parent=root)
+    finally:
+        root.destroy()
+
+
+def run_optional_fixed_design_loop(
+    model: ModuleType,
+    data: dict,
+    settings: dict,
+) -> list[dict]:
+    """Repeatedly run fixed-azimuth or fixed-tilt analyses until the user stops."""
+    analyses: list[dict] = []
+
+    while True:
+        request = ask_fixed_analysis_request()
+        if request is None:
+            break
+
+        fixed_kind, fixed_value = request
+        best, _evaluation_table = run_fixed_design_analysis(
+            model=model,
+            data=data,
+            settings=settings,
+            fixed_kind=fixed_kind,
+            fixed_value=fixed_value,
+        )
+
+        show_fixed_analysis_result(fixed_kind, fixed_value, best)
+
+        analyses.append(
+            {
+                "fixed_variable": fixed_kind,
+                "fixed_value_deg": float(fixed_value),
+                "best_tilt_deg": float(best["tilt_deg"]),
+                "best_azimuth_deg": float(best["azimuth_deg"]),
+                "specific_yield_kWh_per_kWp": float(best["specific_yield_kWh_per_kWp"]),
+                "mean_capacity_factor": float(best["mean_capacity_factor"]),
+                "max_capacity_factor": float(best["max_capacity_factor"]),
+                "mean_poa_Wm2": float(best["mean_poa_Wm2"]),
+            }
+        )
+
+    return analyses
+
+
+# -----------------------------------------------------------------------------
+# OUTPUT
+# -----------------------------------------------------------------------------
+def write_output(
+    output_path: Path,
+    model_path: Path,
+    irradiation_path: Path,
+    temperature_path: Path,
+    year: int,
+    model: ModuleType,
+    site,
+    settings: dict,
+    best: dict,
+    coarse: pd.DataFrame,
+    fine: pd.DataFrame,
+    all_results: pd.DataFrame,
+    best_hourly: pd.DataFrame,
+    fixed_design_analyses: list[dict] | None = None,
+):
+    summary_rows = [
+        ("Objective", "Maximize annual specific production [kWh/kWp]"),
+        ("Year", year),
+        ("Site", getattr(site, "name", "Hornsund")),
+        ("Latitude [deg]", getattr(site, "latitude_deg", np.nan)),
+        ("Longitude [deg E]", getattr(site, "longitude_east_deg", np.nan)),
+        ("Base PV script", str(model_path)),
+        ("Irradiation file", str(irradiation_path)),
+        ("Temperature file", str(temperature_path)),
+        ("Best tilt [deg]", best["tilt_deg"]),
+        ("Best azimuth [deg]", best["azimuth_deg"]),
+        ("Best specific yield [kWh/kWp]", best["specific_yield_kWh_per_kWp"]),
+        ("Best mean CF [-]", best["mean_capacity_factor"]),
+        ("Best max CF [-]", best["max_capacity_factor"]),
+        ("Best mean POA [W/m2]", best["mean_poa_Wm2"]),
+        ("Tilt search range [deg]", f"{settings['tilt_min']} to {settings['tilt_max']}"),
+        ("Azimuth search range [deg]", f"{settings['azimuth_min']} to {settings['azimuth_max']}"),
+        ("Coarse tilt step [deg]", settings["coarse_tilt_step"]),
+        ("Coarse azimuth step [deg]", settings["coarse_azimuth_step"]),
+        ("Fine step [deg]", settings["fine_step"]),
+        ("ALBEDO_MIN inherited from base model", float(model.ALBEDO_MIN)),
+        ("ALBEDO_MAX inherited from base model", float(model.ALBEDO_MAX)),
+        ("Derating factor inherited from base model", float(model.DERATING_FACTOR)),
+        ("NOCT inherited from base model [degC]", float(model.NOCT)),
+        ("Temperature coefficient inherited [1/degC]", float(model.TEMPERATURE_COEFFICIENT)),
+        ("Direct input interpretation", str(model.DIRECT_INPUT_TYPE)),
+        ("Hourly conversion", str(model.HOURLY_CONVERSION)),
+        (
+            "Albedo model",
+            "2015 Hornsund/Fuglebekken snow-cover reference from selected base PV script",
+        ),
+    ]
+
+    summary = pd.DataFrame(summary_rows, columns=["Parameter", "Value"])
+
+    top20 = all_results.head(20).copy()
+
+    # Excel does not support timezone-aware datetime values.
+    # Keep best_hourly unchanged for plotting/calculations, but create an
+    # Excel-safe copy in which UTC timestamps are timezone-naive.
+    best_hourly_excel = best_hourly.copy()
+    if "timestamp_utc" in best_hourly_excel.columns:
+        timestamps_excel = pd.to_datetime(
+            best_hourly_excel["timestamp_utc"],
+            utc=True,
+            errors="coerce",
+        )
+        best_hourly_excel["timestamp_utc"] = (
+            timestamps_excel.dt.tz_convert("UTC").dt.tz_localize(None)
+        )
+
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        summary.to_excel(writer, sheet_name="Summary", index=False)
+        top20.to_excel(writer, sheet_name="Top 20", index=False)
+        coarse.to_excel(writer, sheet_name="Coarse grid", index=False)
+        fine.to_excel(writer, sheet_name="Fine grid", index=False)
+        all_results.to_excel(writer, sheet_name="All evaluations", index=False)
+        best_hourly_excel.to_excel(writer, sheet_name="Best hourly", index=False)
+
+        if fixed_design_analyses:
+            pd.DataFrame(fixed_design_analyses).to_excel(
+                writer,
+                sheet_name="Fixed design analyses",
+                index=False,
+            )
+
+        for sheet_name in writer.book.sheetnames:
+            ws = writer.book[sheet_name]
+            ws.freeze_panes = "A2"
+            for cell in ws[1]:
+                cell.font = cell.font.copy(bold=True)
+            for col in ws.columns:
+                letter = col[0].column_letter
+                max_len = min(
+                    45,
+                    max(len(str(cell.value)) if cell.value is not None else 0 for cell in col) + 2,
+                )
+                ws.column_dimensions[letter].width = max(12, max_len)
+
+
+def plot_coarse_heatmap(coarse: pd.DataFrame, best: dict):
+    pivot = coarse.pivot_table(
+        index="tilt_deg",
+        columns="azimuth_deg",
+        values="specific_yield_kWh_per_kWp",
+        aggfunc="max",
+    )
+
+    fig, ax = plt.subplots(figsize=(11, 7))
+    image = ax.imshow(
+        pivot.to_numpy(),
+        origin="lower",
+        aspect="auto",
+        extent=[
+            float(pivot.columns.min()),
+            float(pivot.columns.max()),
+            float(pivot.index.min()),
+            float(pivot.index.max()),
+        ],
+    )
+    fig.colorbar(image, ax=ax, label="Specific yield [kWh/kWp]")
+    ax.scatter([best["azimuth_deg"]], [best["tilt_deg"]], marker="x", s=90)
+    ax.set_xlabel("Surface azimuth [deg] (0 = South, -East, +West)")
+    ax.set_ylabel("Surface tilt [deg]")
+    ax.set_title("Hornsund PV orientation optimization - coarse search")
+    fig.tight_layout()
+    plt.show()
+
+
+def plot_best_cf(best_hourly: pd.DataFrame, best: dict):
+    fig, ax = plt.subplots(figsize=(13, 5))
+    ax.plot(
+        best_hourly["timestamp_utc"],
+        best_hourly["capacity_factor_kW_per_kWp"],
+        linewidth=0.8,
+    )
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Capacity factor [kW/kWp]")
+    ax.set_title(
+        f"Best fixed orientation: tilt={best['tilt_deg']:.2f}°, "
+        f"azimuth={best['azimuth_deg']:.2f}°"
+    )
+    ax.set_ylim(bottom=0.0)
+    ax.grid(True, linewidth=0.6)
+    fig.tight_layout()
+    plt.show()
+
+
+# -----------------------------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------------------------
+def main(show_plots: bool = True):
+    print("=" * 78)
+    print("HORNSUND PV DESIGN OPTIMIZATION")
+    print("=" * 78)
+
+    print("1. Select the existing Hornsund PV capacity-factor script...")
+    model_path = choose_python_model_file()
+    model = import_pv_model(model_path)
+
+    print("2. Select the irradiation CSV...")
+    irradiation_path = choose_irradiation_file()
+    site, source_3h = model.read_hornsund_csv(irradiation_path)
+
+    print("3. Select the SEKLIMA temperature CSV...")
+    temperature_path = choose_temperature_file()
+    temperature_data = model.read_temperature_csv(temperature_path)
+
+    solar_years = sorted(source_3h["timestamp"].dt.year.dropna().astype(int).unique())
+    temperature_years = sorted(
+        temperature_data["timestamp_utc"].dt.year.dropna().astype(int).unique()
+    )
+    candidate_years = sorted(set(solar_years) & set(temperature_years))
+
+    settings = ask_optimization_setup(candidate_years)
+    year = int(settings["year"])
+
+    print("\nMODEL PARAMETERS INHERITED FROM BASE SCRIPT")
+    print("-------------------------------------------")
+    print(f"ALBEDO_MIN = {model.ALBEDO_MIN}")
+    print(f"ALBEDO_MAX = {model.ALBEDO_MAX}")
+    print(f"DERATING_FACTOR = {model.DERATING_FACTOR}")
+    print(f"NOCT = {model.NOCT} °C")
+    print(f"TEMPERATURE_COEFFICIENT = {model.TEMPERATURE_COEFFICIENT} 1/°C")
+    print(f"DIRECT_INPUT_TYPE = {model.DIRECT_INPUT_TYPE}")
+    print(f"HOURLY_CONVERSION = {model.HOURLY_CONVERSION}")
+
+    source_year = source_3h[source_3h["timestamp"].dt.year == year].copy()
+    if source_year.empty:
+        raise ValueError(f"No irradiation data found for {year}.")
+
+    hourly = model.to_hourly(source_year)
+    hourly, temperature_quality = model.attach_temperature(
+        hourly, temperature_data, year
+    )
+
+    print("\nPRECOMPUTING YEAR-INDEPENDENT ORIENTATION TERMS...")
+    data = prepare_hourly_model_data(model, site, hourly)
+
+    best, coarse, fine, all_results = optimize_orientation(model, data, settings)
+    best_metrics, best_hourly = evaluate_orientation(
+        model,
+        data,
+        best["tilt_deg"],
+        best["azimuth_deg"],
+        return_hourly=True,
+    )
+    best.update(best_metrics)
+
+    print("\nOPTIMUM FOUND")
+    print("-------------")
+    print(f"Tilt:             {best['tilt_deg']:.2f} deg")
+    print(f"Azimuth:          {best['azimuth_deg']:.2f} deg")
+    print(
+        f"Specific yield:   {best['specific_yield_kWh_per_kWp']:.2f} kWh/kWp"
+    )
+    print(f"Mean CF:          {best['mean_capacity_factor']:.5f}")
+    print(f"Maximum CF:       {best['max_capacity_factor']:.5f}")
+    print(f"Mean POA:         {best['mean_poa_Wm2']:.2f} W/m2")
+
+    if temperature_quality:
+        print("\nTemperature data quality:")
+        for key, value in temperature_quality.items():
+            print(f"  {key}: {value}")
+
+    # Optional repeated 1-D analyses:
+    # - fix azimuth -> find the best tilt;
+    # - fix tilt -> find the best azimuth.
+    # After each result, the script asks again until the user selects NO.
+    fixed_design_analyses = run_optional_fixed_design_loop(
+        model=model,
+        data=data,
+        settings=settings,
+    )
+
+    output_path = choose_output_file(f"PV_design_optimization_Hornsund_{year}.xlsx")
+    write_output(
+        output_path=output_path,
+        model_path=model_path,
+        irradiation_path=irradiation_path,
+        temperature_path=temperature_path,
+        year=year,
+        model=model,
+        site=site,
+        settings=settings,
+        best=best,
+        coarse=coarse,
+        fine=fine,
+        all_results=all_results,
+        best_hourly=best_hourly,
+        fixed_design_analyses=fixed_design_analyses,
+    )
+
+    print(f"\nCreated: {output_path}")
+
+    if messagebox is not None:
+        root = _make_root()
+        messagebox.showinfo(
+            "PV design optimization completed",
+            (
+                f"Best fixed orientation for {year}:\n\n"
+                f"Tilt = {best['tilt_deg']:.2f}°\n"
+                f"Azimuth = {best['azimuth_deg']:.2f}°\n"
+                f"Specific yield = {best['specific_yield_kWh_per_kWp']:.1f} kWh/kWp\n"
+                f"Mean CF = {best['mean_capacity_factor']:.4f}\n\n"
+                f"Saved to:\n{output_path}"
+            ),
+            parent=root,
+        )
+        root.destroy()
+
+    if show_plots:
+        plot_coarse_heatmap(coarse, best)
+        plot_best_cf(best_hourly, best)
+
+
+if __name__ == "__main__":
+    main()

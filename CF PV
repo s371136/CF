@@ -1,0 +1,1756 @@
+"""Hourly PV capacity factor for Hornsund from 3-hourly horizontal irradiation data.
+
+Input format (as in Insol_3hrl_HOR_2015-2016.csv):
+    line 1: site metadata, e.g. "Hornsund 76.966666 N  15.716666 E"
+    line 2: Date, Global AllSky, Diffuse AllSky, Direct AllSky
+    following lines: 3-hourly values in W/m², timestamps in UTC.
+
+IMPORTANT INTERPRETATION
+------------------------
+The input file satisfies, row by row:
+
+    Global = Diffuse + Direct
+
+and is labelled HOR (horizontal). Therefore this script interprets:
+
+    Global  -> GHI  = Global Horizontal Irradiance
+    Diffuse -> DHI  = Diffuse Horizontal Irradiance
+    Direct  -> BHI  = Beam/Direct Horizontal Irradiance
+
+NOT as DNI.
+
+poa= plane of array (è quello che nello scorso script era pv)
+
+The direct component on the tilted PV plane is obtained from:
+
+    BHI = DNI * cos(theta_z)
+    POA_direct = DNI * cos(theta_i)
+
+therefore:
+
+    POA_direct = BHI * cos(theta_i) / cos(theta_z)
+
+when the Sun is above the horizon and the front side of the module is illuminated.
+
+The model then adds isotropic diffuse and ground-reflected irradiance:
+
+    POA_diffuse   = DHI * (1 + cos(beta)) / 2
+    POA_reflected = GHI * albedo(t) * (1 - cos(beta)) / 2
+    POA_global    = POA_direct + POA_diffuse + POA_reflected
+
+GROUND ALBEDO
+-------------
+The GUI asks only for a minimum and maximum ground albedo.
+
+Instead of using arbitrary seasonal transition dates, rho(t) is linked to the
+observed 2015 Hornsund/Fuglebekken snow-cover evolution used as a reference:
+
+    17 May  -> SCE = 0.90
+    10 Jun  -> SCE = 0.75
+    15 Jun  -> SCE = 0.50
+    20 Jun  -> SCE = 0.25
+    27 Jun  -> SCE = 0.10
+    06 Jul  -> SCE = 0.02
+
+The ground albedo is then calculated from:
+
+    rho(t) = rho_min + SCE(t) * (rho_max - rho_min)
+
+Between the listed dates SCE(t) is linearly interpolated. Before 17 May the
+reference snow-cover fraction is set to 1.0 (fully snow-covered ground), while
+from 06 July onward it is set to 0.0 (snow-free ground).
+
+IMPORTANT: only the observed 2015 spring/summer snowmelt profile is used here.
+No autumn snow-return dates are invented. Therefore the model keeps rho = rho_min
+after 06 July. If autumn snow-cover observations are added later, this section
+can be extended without changing the PV equations.
+
+The irradiation CSV does not contain ambient temperature, so the script asks for a
+separate SEKLIMA temperature file and applies the NOCT temperature correction.
+"""
+
+from __future__ import annotations
+
+import math
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+except ImportError:  # pragma: no cover
+    tk = None
+    filedialog = None
+    messagebox = None
+
+
+# ============================ USER INPUTS ============================
+# PV orientation. Azimuth convention:
+#   0° = South, -90° = East, +90° = West, +/-180° = North.
+SURFACE_TILT = 60.0          # [deg]
+SURFACE_AZIMUTH = 0.0        # [deg]
+
+# Ground reflection.
+# The GUI asks only for the minimum and maximum physically meaningful albedo.
+ALBEDO_MIN = 0.20   # [-] snow-free / dark ground
+ALBEDO_MAX = 0.80   # [-] fully snow-covered ground
+
+# Observed 2015 Hornsund/Fuglebekken snow-cover reference points.
+# Values are Snow Cover Extent (SCE) fractions, not direct albedo measurements.
+# The same 2015 month/day profile is used as the reference profile if another
+# year is selected in the GUI.
+SNOW_COVER_2015_POINTS = [
+    ((5, 17), 0.90),
+    ((6, 10), 0.75),
+    ((6, 15), 0.50),
+    ((6, 20), 0.25),
+    ((6, 27), 0.10),
+    ((7, 6),  0.02),
+]
+
+# Electrical losses not modelled separately.
+DERATING_FACTOR = 0.82       # [-]
+CLIP_AT_RATED_POWER = True
+
+# Interpretation of the source Direct column.
+# Current evidence (HOR filename and exact GHI = DHI + Direct closure) supports BHI.
+# If the source documentation later confirms DNI, change this single line to "DNI".
+DIRECT_INPUT_TYPE = "BHI"
+
+# 3-hourly -> hourly conversion.
+# "linear": linearly interpolate the values at the 3-hour timestamps.
+# "repeat": repeat each 3-hour value for the next 3 one-hour steps.
+# Use "repeat" instead if the source documentation confirms that values are
+# 3-hour interval MEANS rather than values representative of the timestamp.
+HOURLY_CONVERSION = "linear"
+
+# Keep leap years as 8784 h by default. Set True only if a downstream model
+# strictly requires 8760 h and you intentionally want to remove 29 February.
+DROP_FEB29 = False
+
+# Numerical protection close to sunrise/sunset. BHI/cos(theta_z) becomes unstable
+# when the Sun is extremely close to the horizon.
+MIN_SOLAR_ELEVATION_DEG = 3.0
+
+# Temperature model. Air temperature is read from the separate SEKLIMA file.
+USE_TEMPERATURE_CORRECTION = True
+NOCT = 45.0                         # [°C]
+TEMPERATURE_COEFFICIENT = -0.0035   # 1/°C   SunPower E20-327
+REFERENCE_CELL_TEMPERATURE = 25.0  # [°C]
+NOCT_REFERENCE_AMBIENT_TEMPERATURE = 20.0  # [°C]
+NOCT_REFERENCE_IRRADIANCE = 800.0          # [W/m²]
+TEMPERATURE_TIME_OFFSET_HOURS = 1.0        # Norwegian mean time = UTC+1
+INTERPOLATE_MISSING_TEMPERATURE = True
+# ===================================================================
+
+
+@dataclass(frozen=True)
+class Site:
+    name: str
+    latitude_deg: float       # North positive
+    longitude_east_deg: float # East positive
+
+
+@dataclass(frozen=True)
+class SolarGeometry:
+    declination_deg: float
+    hour_angle_deg: float
+    zenith_deg: float
+    elevation_deg: float
+    azimuth_deg: float
+    cos_zenith: float
+    cos_incidence: float
+    incidence_deg: float
+
+
+def clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def snow_cover_fraction_2015_reference(timestamp) -> float:
+    """Return the 2015 Hornsund/Fuglebekken reference Snow Cover Extent fraction.
+
+    The six published 2015 SCE points are linearly interpolated in time.
+    Before 17 May the ground is treated as fully snow covered (SCE = 1).
+    From 06 July onward it is treated as snow free (SCE = 0).
+
+    No autumn snow-return profile is imposed because no equivalent observed
+    autumn SCE series is included in the current model.
+    """
+    year = int(timestamp.year)
+
+    anchors = [
+        (
+            pd.Timestamp(
+                year=year,
+                month=month,
+                day=day,
+                tz="UTC",
+            ),
+            float(sce),
+        )
+        for (month, day), sce in SNOW_COVER_2015_POINTS
+    ]
+
+    current = pd.Timestamp(timestamp)
+    if current.tzinfo is None:
+        current = current.tz_localize("UTC")
+    else:
+        current = current.tz_convert("UTC")
+
+    first_time, _ = anchors[0]
+    last_time, _ = anchors[-1]
+
+    if current < first_time:
+        return 1.0
+
+    # The final observation is <2% snow cover; from that date onward the
+    # model treats the surrounding ground as effectively snow free.
+    if current >= last_time:
+        return 0.0
+
+    for (time_a, sce_a), (time_b, sce_b) in zip(anchors[:-1], anchors[1:]):
+        if time_a <= current < time_b:
+            total_seconds = (time_b - time_a).total_seconds()
+            elapsed_seconds = (current - time_a).total_seconds()
+            fraction = elapsed_seconds / total_seconds
+            sce = sce_a + fraction * (sce_b - sce_a)
+            return clamp(float(sce), 0.0, 1.0)
+
+    return 0.0
+
+
+def ground_albedo_for_timestamp(timestamp) -> tuple[float, float]:
+    """Return (rho(t), SCE(t)) using min/max albedo and the 2015 snow-cover profile."""
+    snow_fraction = snow_cover_fraction_2015_reference(timestamp)
+    rho = ALBEDO_MIN + snow_fraction * (ALBEDO_MAX - ALBEDO_MIN)
+    return float(rho), float(snow_fraction)
+
+
+def choose_input_file() -> Path:
+    if tk is None:
+        raise RuntimeError("Tkinter is not available. Set the input path directly in main().")
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    selected = filedialog.askopenfilename(
+        title="Select Hornsund irradiation CSV",
+        filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+    )
+    root.destroy()
+    if not selected:
+        raise SystemExit("No input file selected.")
+    return Path(selected)
+
+
+
+def choose_temperature_file() -> Path:
+    """Select the SEKLIMA CSV containing hourly Hornsund air temperature."""
+    if tk is None:
+        raise RuntimeError("Tkinter is not available.")
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+
+    selected = filedialog.askopenfilename(
+        parent=root,
+        title="Select SEKLIMA temperature file",
+        filetypes=[
+            ("CSV files", "*.csv"),
+            ("All files", "*.*"),
+        ],
+    )
+    root.destroy()
+
+    if not selected:
+        raise SystemExit("No temperature file selected.")
+
+    return Path(selected)
+
+
+def choose_output_file(default_name: str) -> Path:
+    if tk is None:
+        return Path(default_name)
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    selected = filedialog.asksaveasfilename(
+        title="Save PV capacity-factor results",
+        defaultextension=".xlsx",
+        initialfile=default_name,
+        filetypes=[("Excel workbook", "*.xlsx")],
+    )
+    root.destroy()
+    if not selected:
+        raise SystemExit("No output file selected.")
+    return Path(selected)
+
+
+
+def ask_analysis_setup(
+    candidate_years: list[int],
+    year_counts: dict[int, int],
+) -> tuple[int, dict]:
+    """Choose one year and the editable PV-model parameters."""
+    if tk is None:
+        raise RuntimeError("Tkinter is not available.")
+
+    if not candidate_years:
+        raise ValueError("No analysable years were found in the input file.")
+
+    from tkinter import ttk
+
+    default_year = 2015 if 2015 in candidate_years else candidate_years[0]
+
+    result = {
+        "year": None,
+        "settings": None,
+    }
+
+    dialog = tk.Tk()
+    dialog.title("Hornsund PV capacity factor - analysis settings")
+    dialog.resizable(False, False)
+
+    try:
+        dialog.attributes("-topmost", True)
+    except Exception:
+        pass
+
+    outer = ttk.Frame(dialog, padding=16)
+    outer.grid(row=0, column=0, sticky="nsew")
+
+    ttk.Label(
+        outer,
+        text="PV capacity factor - Hornsund",
+        font=("TkDefaultFont", 11, "bold"),
+    ).grid(
+        row=0,
+        column=0,
+        columnspan=3,
+        sticky="w",
+    )
+
+    ttk.Label(
+        outer,
+        text=(
+            "Select the year to analyse and, if needed, modify the PV-model "
+            "parameters. The proposed values are the current script defaults."
+        ),
+        justify="left",
+        wraplength=680,
+    ).grid(
+        row=1,
+        column=0,
+        columnspan=3,
+        sticky="w",
+        pady=(4, 12),
+    )
+
+    # ------------------------------------------------------------------
+    # YEAR
+    # ------------------------------------------------------------------
+    ttk.Label(
+        outer,
+        text="Year to analyse",
+    ).grid(
+        row=2,
+        column=0,
+        sticky="w",
+        pady=(3, 10),
+    )
+
+    year_labels = [
+        f"{year} ({year_counts.get(year, 0)} source rows)"
+        for year in candidate_years
+    ]
+
+    default_index = candidate_years.index(default_year)
+    year_var = tk.StringVar(value=year_labels[default_index])
+
+    year_combo = ttk.Combobox(
+        outer,
+        textvariable=year_var,
+        values=year_labels,
+        state="readonly",
+        width=38,
+    )
+    year_combo.grid(
+        row=2,
+        column=1,
+        columnspan=2,
+        sticky="ew",
+        padx=(12, 8),
+        pady=(3, 10),
+    )
+
+    ttk.Separator(
+        outer,
+        orient="horizontal",
+    ).grid(
+        row=3,
+        column=0,
+        columnspan=3,
+        sticky="ew",
+        pady=(2, 10),
+    )
+
+    # ------------------------------------------------------------------
+    # NUMERIC PARAMETERS
+    # ------------------------------------------------------------------
+    fields = [
+        ("Surface tilt", "surface_tilt", SURFACE_TILT, "deg"),
+        ("Surface azimuth", "surface_azimuth", SURFACE_AZIMUTH, "deg"),
+        ("Minimum ground albedo", "albedo_min", ALBEDO_MIN, "-"),
+        ("Maximum ground albedo", "albedo_max", ALBEDO_MAX, "-"),
+        ("Derating factor", "derating_factor", DERATING_FACTOR, "-"),
+        (
+            "Minimum solar elevation",
+            "min_solar_elevation",
+            MIN_SOLAR_ELEVATION_DEG,
+            "deg",
+        ),
+        ("NOCT", "noct", NOCT, "°C"),
+        (
+            "Temperature coefficient γ",
+            "temperature_coefficient",
+            TEMPERATURE_COEFFICIENT,
+            "1/°C",
+        ),
+        (
+            "Reference cell temperature",
+            "reference_cell_temperature",
+            REFERENCE_CELL_TEMPERATURE,
+            "°C",
+        ),
+        (
+            "NOCT reference ambient temperature",
+            "noct_reference_ambient_temperature",
+            NOCT_REFERENCE_AMBIENT_TEMPERATURE,
+            "°C",
+        ),
+        (
+            "NOCT reference irradiance",
+            "noct_reference_irradiance",
+            NOCT_REFERENCE_IRRADIANCE,
+            "W/m²",
+        ),
+        (
+            "Temperature file UTC offset",
+            "temperature_time_offset_hours",
+            TEMPERATURE_TIME_OFFSET_HOURS,
+            "h",
+        ),
+    ]
+
+    variables = {}
+    first_field_row = 4
+
+    for row_index, (label, key, default, unit) in enumerate(
+        fields,
+        start=first_field_row,
+    ):
+        ttk.Label(
+            outer,
+            text=label,
+        ).grid(
+            row=row_index,
+            column=0,
+            sticky="w",
+            pady=3,
+        )
+
+        variable = tk.StringVar(value=str(default))
+        variables[key] = variable
+
+        ttk.Entry(
+            outer,
+            textvariable=variable,
+            width=24,
+        ).grid(
+            row=row_index,
+            column=1,
+            sticky="ew",
+            padx=(12, 8),
+            pady=3,
+        )
+
+        ttk.Label(
+            outer,
+            text=unit,
+            width=7,
+        ).grid(
+            row=row_index,
+            column=2,
+            sticky="w",
+            pady=3,
+        )
+
+    options_row = first_field_row + len(fields)
+
+    ttk.Separator(
+        outer,
+        orient="horizontal",
+    ).grid(
+        row=options_row,
+        column=0,
+        columnspan=3,
+        sticky="ew",
+        pady=(12, 10),
+    )
+
+    # ------------------------------------------------------------------
+    # OPTIONS
+    # ------------------------------------------------------------------
+    ttk.Label(
+        outer,
+        text="Direct source column",
+    ).grid(
+        row=options_row + 1,
+        column=0,
+        sticky="w",
+        pady=3,
+    )
+
+    direct_var = tk.StringVar(value=DIRECT_INPUT_TYPE)
+    direct_combo = ttk.Combobox(
+        outer,
+        textvariable=direct_var,
+        values=["BHI", "DNI"],
+        state="readonly",
+        width=21,
+    )
+    direct_combo.grid(
+        row=options_row + 1,
+        column=1,
+        sticky="ew",
+        padx=(12, 8),
+        pady=3,
+    )
+
+    ttk.Label(
+        outer,
+        text="3-hourly → hourly",
+    ).grid(
+        row=options_row + 2,
+        column=0,
+        sticky="w",
+        pady=3,
+    )
+
+    conversion_var = tk.StringVar(value=HOURLY_CONVERSION)
+    conversion_combo = ttk.Combobox(
+        outer,
+        textvariable=conversion_var,
+        values=["linear", "repeat"],
+        state="readonly",
+        width=21,
+    )
+    conversion_combo.grid(
+        row=options_row + 2,
+        column=1,
+        sticky="ew",
+        padx=(12, 8),
+        pady=3,
+    )
+
+    clip_var = tk.BooleanVar(value=CLIP_AT_RATED_POWER)
+    ttk.Checkbutton(
+        outer,
+        text="Clip capacity factor at 1.0",
+        variable=clip_var,
+    ).grid(
+        row=options_row + 3,
+        column=0,
+        columnspan=3,
+        sticky="w",
+        pady=(8, 2),
+    )
+
+    drop_feb29_var = tk.BooleanVar(value=DROP_FEB29)
+    ttk.Checkbutton(
+        outer,
+        text="Remove 29 February in leap years (2016: 8784 → 8760 h)",
+        variable=drop_feb29_var,
+    ).grid(
+        row=options_row + 4,
+        column=0,
+        columnspan=3,
+        sticky="w",
+        pady=2,
+    )
+
+    interpolate_temp_var = tk.BooleanVar(
+        value=INTERPOLATE_MISSING_TEMPERATURE
+    )
+    ttk.Checkbutton(
+        outer,
+        text=(
+            "Interpolate missing air-temperature values "
+            "(large gaps are reported as warnings)"
+        ),
+        variable=interpolate_temp_var,
+    ).grid(
+        row=options_row + 5,
+        column=0,
+        columnspan=3,
+        sticky="w",
+        pady=(2, 2),
+    )
+
+    ttk.Label(
+        outer,
+        text=(
+            "Temperature correction: "
+            "Tcell = Tair + (NOCT - Tair,NOCT) / G_NOCT × POA; "
+            "fT = 1 + γ × (Tcell - Tref)."
+        ),
+        justify="left",
+        wraplength=680,
+    ).grid(
+        row=options_row + 7,
+        column=0,
+        columnspan=3,
+        sticky="w",
+        pady=(8, 0),
+    )
+
+    def parse_float(key: str, label: str) -> float:
+        raw = variables[key].get().strip().replace(",", ".")
+        try:
+            return float(raw)
+        except ValueError as exc:
+            raise ValueError(f"'{label}' must be a number.") from exc
+
+    def accept():
+        try:
+            selected_year = int(year_var.get().split()[0])
+
+            settings = {
+                "surface_tilt": parse_float("surface_tilt", "Surface tilt"),
+                "surface_azimuth": parse_float(
+                    "surface_azimuth",
+                    "Surface azimuth",
+                ),
+                "albedo_min": parse_float(
+                    "albedo_min",
+                    "Minimum ground albedo",
+                ),
+                "albedo_max": parse_float(
+                    "albedo_max",
+                    "Maximum ground albedo",
+                ),
+                "derating_factor": parse_float(
+                    "derating_factor",
+                    "Derating factor",
+                ),
+                "min_solar_elevation": parse_float(
+                    "min_solar_elevation",
+                    "Minimum solar elevation",
+                ),
+                "direct_input_type": direct_var.get(),
+                "hourly_conversion": conversion_var.get(),
+                "clip_at_rated_power": bool(clip_var.get()),
+                "drop_feb29": bool(drop_feb29_var.get()),
+                "noct": parse_float("noct", "NOCT"),
+                "temperature_coefficient": parse_float(
+                    "temperature_coefficient",
+                    "Temperature coefficient",
+                ),
+                "reference_cell_temperature": parse_float(
+                    "reference_cell_temperature",
+                    "Reference cell temperature",
+                ),
+                "noct_reference_ambient_temperature": parse_float(
+                    "noct_reference_ambient_temperature",
+                    "NOCT reference ambient temperature",
+                ),
+                "noct_reference_irradiance": parse_float(
+                    "noct_reference_irradiance",
+                    "NOCT reference irradiance",
+                ),
+                "temperature_time_offset_hours": parse_float(
+                    "temperature_time_offset_hours",
+                    "Temperature file UTC offset",
+                ),
+                "interpolate_missing_temperature": bool(
+                    interpolate_temp_var.get()
+                ),
+            }
+
+            if not 0.0 <= settings["surface_tilt"] <= 90.0:
+                raise ValueError("Surface tilt must be between 0 and 90 deg.")
+
+            if not -180.0 <= settings["surface_azimuth"] <= 180.0:
+                raise ValueError("Surface azimuth must be between -180 and +180 deg.")
+
+            if not 0.0 <= settings["albedo_min"] <= 1.0:
+                raise ValueError("Minimum ground albedo must be between 0 and 1.")
+            if not 0.0 <= settings["albedo_max"] <= 1.0:
+                raise ValueError("Maximum ground albedo must be between 0 and 1.")
+            if settings["albedo_min"] > settings["albedo_max"]:
+                raise ValueError("Minimum ground albedo cannot exceed maximum ground albedo.")
+
+            if not 0.0 < settings["derating_factor"] <= 1.0:
+                raise ValueError("Derating factor must be > 0 and <= 1.")
+
+            if not 0.0 <= settings["min_solar_elevation"] < 90.0:
+                raise ValueError(
+                    "Minimum solar elevation must be between 0 and 90 deg."
+                )
+
+            if settings["noct_reference_irradiance"] <= 0.0:
+                raise ValueError("NOCT reference irradiance must be positive.")
+
+            if settings["noct"] <= -100.0 or settings["noct"] >= 150.0:
+                raise ValueError("NOCT value is outside a reasonable range.")
+
+            if settings["temperature_coefficient"] >= 0.0:
+                raise ValueError(
+                    "Temperature coefficient γ is normally negative for PV modules."
+                )
+
+        except (ValueError, IndexError) as exc:
+            messagebox.showerror(
+                "Invalid settings",
+                str(exc),
+                parent=dialog,
+            )
+            return
+
+        result["year"] = selected_year
+        result["settings"] = settings
+        dialog.destroy()
+
+    def cancel():
+        dialog.destroy()
+
+    button_frame = ttk.Frame(outer)
+    button_frame.grid(
+        row=options_row + 8,
+        column=0,
+        columnspan=3,
+        pady=(14, 0),
+        sticky="e",
+    )
+
+    ttk.Button(
+        button_frame,
+        text="Cancel",
+        command=cancel,
+    ).pack(side="right", padx=(8, 0))
+
+    ttk.Button(
+        button_frame,
+        text="Run analysis",
+        command=accept,
+    ).pack(side="right")
+
+    dialog.protocol("WM_DELETE_WINDOW", cancel)
+    dialog.bind("<Escape>", lambda _event: cancel())
+
+    dialog.update_idletasks()
+    x = (dialog.winfo_screenwidth() - dialog.winfo_reqwidth()) // 2
+    y = (dialog.winfo_screenheight() - dialog.winfo_reqheight()) // 2
+    dialog.geometry(f"+{x}+{y}")
+
+    dialog.lift()
+    dialog.focus_force()
+    year_combo.focus_set()
+    dialog.mainloop()
+
+    if result["year"] is None or result["settings"] is None:
+        raise SystemExit("Analysis cancelled.")
+
+    return int(result["year"]), dict(result["settings"])
+
+
+def apply_analysis_settings(settings: dict) -> None:
+    """Apply the values selected in the GUI to the existing model globals."""
+    global SURFACE_TILT
+    global SURFACE_AZIMUTH
+    global ALBEDO_MIN
+    global ALBEDO_MAX
+    global DERATING_FACTOR
+    global CLIP_AT_RATED_POWER
+    global DIRECT_INPUT_TYPE
+    global HOURLY_CONVERSION
+    global DROP_FEB29
+    global MIN_SOLAR_ELEVATION_DEG
+    global NOCT
+    global TEMPERATURE_COEFFICIENT
+    global REFERENCE_CELL_TEMPERATURE
+    global NOCT_REFERENCE_AMBIENT_TEMPERATURE
+    global NOCT_REFERENCE_IRRADIANCE
+    global TEMPERATURE_TIME_OFFSET_HOURS
+    global INTERPOLATE_MISSING_TEMPERATURE
+
+    SURFACE_TILT = float(settings["surface_tilt"])
+    SURFACE_AZIMUTH = float(settings["surface_azimuth"])
+    ALBEDO_MIN = float(settings["albedo_min"])
+    ALBEDO_MAX = float(settings["albedo_max"])
+    DERATING_FACTOR = float(settings["derating_factor"])
+    CLIP_AT_RATED_POWER = bool(settings["clip_at_rated_power"])
+    DIRECT_INPUT_TYPE = str(settings["direct_input_type"])
+    HOURLY_CONVERSION = str(settings["hourly_conversion"])
+    DROP_FEB29 = bool(settings["drop_feb29"])
+    MIN_SOLAR_ELEVATION_DEG = float(settings["min_solar_elevation"])
+    NOCT = float(settings["noct"])
+    TEMPERATURE_COEFFICIENT = float(settings["temperature_coefficient"])
+    REFERENCE_CELL_TEMPERATURE = float(settings["reference_cell_temperature"])
+    NOCT_REFERENCE_AMBIENT_TEMPERATURE = float(
+        settings["noct_reference_ambient_temperature"]
+    )
+    NOCT_REFERENCE_IRRADIANCE = float(settings["noct_reference_irradiance"])
+    TEMPERATURE_TIME_OFFSET_HOURS = float(
+        settings["temperature_time_offset_hours"]
+    )
+    INTERPOLATE_MISSING_TEMPERATURE = bool(
+        settings["interpolate_missing_temperature"]
+    )
+
+
+
+
+def read_temperature_csv(path: Path) -> pd.DataFrame:
+    """Read the SEKLIMA file and convert Norwegian mean time to UTC."""
+    print("Reading SEKLIMA air-temperature file...", flush=True)
+
+    # The supplied SEKLIMA export uses semicolon separators.
+    frame = pd.read_csv(
+        path,
+        sep=";",
+        encoding="utf-8-sig",
+        engine="python",
+    )
+    frame.columns = [str(column).strip() for column in frame.columns]
+
+    time_col = next(
+        (
+            column
+            for column in frame.columns
+            if "time" in column.lower()
+        ),
+        None,
+    )
+    temp_col = next(
+        (
+            column
+            for column in frame.columns
+            if "air temperature" in column.lower()
+            or column.lower().strip() in {"temperature", "temp", "tair"}
+        ),
+        None,
+    )
+
+    if time_col is None or temp_col is None:
+        raise ValueError(
+            "Temperature file must contain a time column and an "
+            "'Air temperature' column. "
+            f"Found columns: {list(frame.columns)}"
+        )
+
+    raw_time = frame[time_col].astype(str).str.strip()
+    local_time = pd.to_datetime(
+        raw_time,
+        format="%d.%m.%Y %H:%M",
+        errors="coerce",
+    )
+
+    missing_time = local_time.isna() & raw_time.ne("")
+    if missing_time.any():
+        local_time.loc[missing_time] = pd.to_datetime(
+            raw_time.loc[missing_time],
+            dayfirst=True,
+            errors="coerce",
+        )
+
+    air_temperature = pd.to_numeric(
+        frame[temp_col],
+        errors="coerce",
+    )
+
+    data = pd.DataFrame(
+        {
+            "timestamp_local": local_time,
+            "air_temperature_C": air_temperature,
+        }
+    ).dropna(subset=["timestamp_local"])
+
+    # Norwegian mean time is UTC+1 by default.
+    data["timestamp_utc"] = (
+        data["timestamp_local"]
+        - pd.to_timedelta(TEMPERATURE_TIME_OFFSET_HOURS, unit="h")
+    )
+
+    data["timestamp_utc"] = data["timestamp_utc"].dt.floor("h")
+
+    data = (
+        data.groupby("timestamp_utc", as_index=False)["air_temperature_C"]
+        .mean()
+        .sort_values("timestamp_utc")
+        .reset_index(drop=True)
+    )
+
+    print(
+        f"Temperature rows read: {len(data)} | "
+        f"UTC range: {data['timestamp_utc'].min()} - "
+        f"{data['timestamp_utc'].max()}",
+        flush=True,
+    )
+
+    return data
+
+
+def longest_missing_run(series: pd.Series) -> int:
+    missing = series.isna().to_numpy()
+
+    longest = 0
+    current = 0
+
+    for value in missing:
+        if value:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+
+    return int(longest)
+
+
+def attach_temperature(
+    hourly: pd.DataFrame,
+    temperature_data: pd.DataFrame,
+    year: int,
+) -> tuple[pd.DataFrame, dict]:
+    """Align SEKLIMA air temperature to the selected solar UTC timestamps."""
+    result = hourly.copy()
+
+    solar_index = pd.DatetimeIndex(result["timestamp"])
+
+    # Solar timestamps are UTC-aware; SEKLIMA timestamps above are naive UTC.
+    target_naive = solar_index.tz_convert("UTC").tz_localize(None)
+
+    source = (
+        temperature_data
+        .set_index("timestamp_utc")["air_temperature_C"]
+        .sort_index()
+    )
+
+    profile = source.reindex(target_naive)
+
+    missing_before = int(profile.isna().sum())
+    longest_gap = longest_missing_run(profile)
+
+    print(
+        f"Temperature {year}: {len(profile) - missing_before}/{len(profile)} "
+        f"hours available; {missing_before} missing; "
+        f"longest gap = {longest_gap} h.",
+        flush=True,
+    )
+
+    if missing_before > 0:
+        if not INTERPOLATE_MISSING_TEMPERATURE:
+            raise ValueError(
+                f"Temperature profile contains {missing_before} missing hours. "
+                "Enable temperature interpolation in the settings window."
+            )
+
+        if longest_gap > 24:
+            print(
+                "WARNING: the temperature series contains a long missing gap "
+                f"({longest_gap} h). Linear interpolation is being used because "
+                "it was enabled in the settings. Treat this period with caution.",
+                flush=True,
+            )
+
+        profile = profile.interpolate(
+            method="time",
+            limit_direction="both",
+        )
+
+    if profile.isna().any():
+        raise ValueError(
+            "Missing temperature values remain after interpolation."
+        )
+
+    result["air_temperature_C"] = profile.to_numpy(dtype=float)
+
+    quality = {
+        "temperature_missing_before_fill": missing_before,
+        "temperature_longest_missing_gap_h": longest_gap,
+        "temperature_interpolation_used": (
+            missing_before > 0 and INTERPOLATE_MISSING_TEMPERATURE
+        ),
+    }
+
+    return result, quality
+
+
+
+def parse_site_metadata(first_line: str) -> Site:
+    """Parse metadata such as: Hornsund 76.966666 N  15.716666 E."""
+    pattern = re.compile(
+        r"^\s*(.*?)\s+([0-9]+(?:\.[0-9]+)?)\s*([NS])\s+"
+        r"([0-9]+(?:\.[0-9]+)?)\s*([EW])\s*$",
+        re.IGNORECASE,
+    )
+    match = pattern.match(first_line.strip())
+    if not match:
+        raise ValueError(
+            "Could not read site coordinates from the first CSV line. "
+            f"Found: {first_line!r}"
+        )
+
+    name, lat_value, lat_dir, lon_value, lon_dir = match.groups()
+    lat = float(lat_value) * (1.0 if lat_dir.upper() == "N" else -1.0)
+    lon_east = float(lon_value) * (1.0 if lon_dir.upper() == "E" else -1.0)
+    return Site(name=name.strip(), latitude_deg=lat, longitude_east_deg=lon_east)
+
+
+def read_hornsund_csv(path: Path) -> tuple[Site, pd.DataFrame]:
+    with path.open("r", encoding="utf-8-sig") as handle:
+        first_line = handle.readline().strip()
+
+    site = parse_site_metadata(first_line)
+
+    # Second row contains the actual CSV header.
+    frame = pd.read_csv(path, skiprows=1)
+    frame.columns = [str(column).strip() for column in frame.columns]
+
+    if frame.shape[1] < 4:
+        raise ValueError("The irradiation file must contain Date, Global, Diffuse and Direct columns.")
+
+    # Identify by meaning rather than by exact full source header.
+    date_col = next((c for c in frame.columns if c.lower() == "date"), None)
+    global_col = next((c for c in frame.columns if "global" in c.lower()), None)
+    diffuse_col = next((c for c in frame.columns if "diffuse" in c.lower()), None)
+    direct_col = next((c for c in frame.columns if "direct" in c.lower()), None)
+
+    missing = [
+        label
+        for label, column in (
+            ("Date", date_col),
+            ("Global", global_col),
+            ("Diffuse", diffuse_col),
+            ("Direct", direct_col),
+        )
+        if column is None
+    ]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}. Found: {list(frame.columns)}")
+
+    data = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(frame[date_col], utc=True, errors="coerce"),
+            "ghi": pd.to_numeric(frame[global_col], errors="coerce"),
+            "dhi": pd.to_numeric(frame[diffuse_col], errors="coerce"),
+            "bhi": pd.to_numeric(frame[direct_col], errors="coerce"),
+        }
+    )
+    data = data.dropna(subset=["timestamp"]).sort_values("timestamp").drop_duplicates("timestamp")
+
+    for column in ("ghi", "dhi", "bhi"):
+        data[column] = data[column].clip(lower=0.0)
+
+    if data[["ghi", "dhi", "bhi"]].isna().any().any():
+        bad = data[data[["ghi", "dhi", "bhi"]].isna().any(axis=1)]
+        raise ValueError(f"Non-numeric irradiation values found in {len(bad)} rows.")
+
+    # Strong consistency check for the horizontal interpretation.
+    closure_error = data["ghi"] - data["dhi"] - data["bhi"]
+    data["ghi_minus_dhi_minus_bhi"] = closure_error
+    max_error = float(closure_error.abs().max()) if len(data) else float("nan")
+
+    print("\nINPUT INTERPRETATION")
+    print("--------------------")
+    print(f"Site: {site.name}")
+    print(f"Latitude:  {site.latitude_deg:.6f} deg")
+    print(f"Longitude: {site.longitude_east_deg:.6f} deg East")
+    print("Global  -> GHI (horizontal)")
+    print("Diffuse -> DHI (horizontal)")
+    print(f"Direct input currently treated as: {DIRECT_INPUT_TYPE}")
+    print("Data check: source values satisfy GHI = DHI + Direct, which supports a BHI interpretation.")
+    print(f"Max |GHI - DHI - BHI| in source data: {max_error:.6g} W/m2")
+
+    return site, data
+
+
+def to_hourly(data_3h: pd.DataFrame) -> pd.DataFrame:
+    """Convert the source 3-hourly series to a 1-hour UTC series."""
+    if HOURLY_CONVERSION not in {"linear", "repeat"}:
+        raise ValueError('HOURLY_CONVERSION must be "linear" or "repeat".')
+
+    data = data_3h.set_index("timestamp")[["ghi", "dhi", "bhi"]].copy()
+
+    first = data.index.min()
+    # Build complete calendar years so 2015 has 8760 h and leap-year 2016 has 8784 h.
+    # The source ends at 21:00 on 31 Dec; for the final two hours of the last year
+    # there is no following 00:00 point, so they are filled with the last available
+    # value after interpolation. For the supplied Hornsund file these winter values
+    # are zero, so this does not alter annual solar energy.
+    last_year = int(data.index.max().year)
+    last = pd.Timestamp(f"{last_year}-12-31 23:00:00", tz="UTC")
+    first_year = int(data.index.min().year)
+    first = pd.Timestamp(f"{first_year}-01-01 00:00:00", tz="UTC")
+    hourly_index = pd.date_range(first, last, freq="1h", tz="UTC")
+
+    if HOURLY_CONVERSION == "linear":
+        hourly = data.reindex(data.index.union(hourly_index)).sort_index()
+        hourly = hourly.interpolate(method="time").reindex(hourly_index).ffill().bfill()
+    else:
+        hourly = data.reindex(hourly_index, method="ffill")
+
+    # The source identity should remain exact (up to floating point) after using
+    # DHI and BHI as the independent quantities. Rebuild GHI accordingly.
+    hourly["ghi"] = hourly["dhi"] + hourly["bhi"]
+    hourly.index.name = "timestamp"
+    hourly = hourly.reset_index()
+
+    if DROP_FEB29:
+        hourly = hourly[~((hourly["timestamp"].dt.month == 2) & (hourly["timestamp"].dt.day == 29))]
+
+    return hourly.reset_index(drop=True)
+
+
+def solar_geometry(timestamp_utc: pd.Timestamp, site: Site) -> SolarGeometry:
+    """Solar position and incidence angle at a UTC timestamp.
+
+    Conventions:
+      latitude: North positive
+      source longitude: East positive
+      solar/surface azimuth: 0 South, negative East, positive West
+      hour angle: negative morning, positive afternoon
+    """
+    if timestamp_utc.tzinfo is None:
+        timestamp_utc = timestamp_utc.tz_localize("UTC")
+    else:
+        timestamp_utc = timestamp_utc.tz_convert("UTC")
+
+    day = int(timestamp_utc.dayofyear)
+    days_in_year = 366 if timestamp_utc.is_leap_year else 365
+    decimal_time = (
+        timestamp_utc.hour
+        + timestamp_utc.minute / 60.0
+        + timestamp_utc.second / 3600.0
+    )
+
+    fractional_year = 2.0 * math.pi / days_in_year * (
+        day - 1 + (decimal_time - 12.0) / 24.0
+    )
+
+    equation_of_time = 229.18 * (
+        0.000075
+        + 0.001868 * math.cos(fractional_year)
+        - 0.032077 * math.sin(fractional_year)
+        - 0.014615 * math.cos(2.0 * fractional_year)
+        - 0.040849 * math.sin(2.0 * fractional_year)
+    )
+
+    declination = (
+        0.006918
+        - 0.399912 * math.cos(fractional_year)
+        + 0.070257 * math.sin(fractional_year)
+        - 0.006758 * math.cos(2.0 * fractional_year)
+        + 0.000907 * math.sin(2.0 * fractional_year)
+        - 0.002697 * math.cos(3.0 * fractional_year)
+        + 0.00148 * math.sin(3.0 * fractional_year)
+    )
+
+    # The original notes use longitudes positive West and negative East.
+    local_longitude_west = -site.longitude_east_deg
+    reference_meridian_west = 0.0  # UTC
+    solar_culmination_time = (
+        12.0
+        + (local_longitude_west - reference_meridian_west) / 15.0
+        - equation_of_time / 60.0
+    )
+
+    hour_angle = math.radians(15.0 * (decimal_time - solar_culmination_time))
+    latitude = math.radians(site.latitude_deg)
+    tilt = math.radians(SURFACE_TILT)
+    surface_azimuth = math.radians(SURFACE_AZIMUTH)
+
+    cos_zenith = (
+        math.sin(latitude) * math.sin(declination)
+        + math.cos(latitude) * math.cos(declination) * math.cos(hour_angle)
+    )
+    cos_zenith = clamp(cos_zenith, -1.0, 1.0)
+    zenith = math.acos(cos_zenith)
+    sin_zenith = max(0.0, math.sin(zenith))
+
+    # Robust atan2 formulation, valid also during polar-day conditions.
+    if sin_zenith < 1e-12:
+        solar_azimuth = 0.0
+    else:
+        sin_azimuth = math.cos(declination) * math.sin(hour_angle) / sin_zenith
+        denominator = sin_zenith * math.cos(latitude)
+        if abs(denominator) < 1e-12:
+            cos_azimuth = 1.0
+        else:
+            cos_azimuth = (
+                cos_zenith * math.sin(latitude) - math.sin(declination)
+            ) / denominator
+        solar_azimuth = math.atan2(
+            clamp(sin_azimuth, -1.0, 1.0),
+            clamp(cos_azimuth, -1.0, 1.0),
+        )
+
+    cos_incidence = (
+        math.cos(tilt) * cos_zenith
+        + math.sin(tilt)
+        * sin_zenith
+        * math.cos(solar_azimuth - surface_azimuth)
+    )
+    cos_incidence = clamp(cos_incidence, -1.0, 1.0)
+
+    return SolarGeometry(
+        declination_deg=math.degrees(declination),
+        hour_angle_deg=math.degrees(hour_angle),
+        zenith_deg=math.degrees(zenith),
+        elevation_deg=90.0 - math.degrees(zenith),
+        azimuth_deg=math.degrees(solar_azimuth),
+        cos_zenith=cos_zenith,
+        cos_incidence=cos_incidence,
+        incidence_deg=math.degrees(math.acos(cos_incidence)),
+    )
+
+
+def calculate_pv(hourly: pd.DataFrame, site: Site) -> pd.DataFrame:
+    records: list[dict] = []
+    tilt = math.radians(SURFACE_TILT)
+    sky_view_factor = (1.0 + math.cos(tilt)) / 2.0
+    ground_view_factor = (1.0 - math.cos(tilt)) / 2.0
+
+    for row in hourly.itertuples(index=False):
+        timestamp = row.timestamp
+        geometry = solar_geometry(timestamp, site)
+
+        ghi = float(row.ghi)
+        dhi = float(row.dhi)
+        bhi = float(row.bhi)
+
+        # Transform the source Direct component onto the tilted PV plane.
+        derived_dni = 0.0
+        poa_direct = 0.0
+
+        sun_high_enough = geometry.elevation_deg >= MIN_SOLAR_ELEVATION_DEG
+        module_front_illuminated = geometry.cos_incidence > 0.0
+
+        if DIRECT_INPUT_TYPE.upper() == "BHI":
+            # Source Direct is horizontal: BHI = DNI*cos(theta_z).
+            if sun_high_enough and geometry.cos_zenith > 0.0 and bhi > 0.0:
+                derived_dni = bhi / geometry.cos_zenith
+                if module_front_illuminated:
+                    poa_direct = derived_dni * geometry.cos_incidence
+        elif DIRECT_INPUT_TYPE.upper() == "DNI":
+            # Alternative only if confirmed by the source documentation.
+            derived_dni = bhi
+            if geometry.zenith_deg < 90.0 and module_front_illuminated:
+                poa_direct = derived_dni * geometry.cos_incidence
+        else:
+            raise ValueError('DIRECT_INPUT_TYPE must be "BHI" or "DNI".')
+
+        poa_diffuse = dhi * sky_view_factor
+        ground_albedo, snow_cover_fraction = ground_albedo_for_timestamp(timestamp)
+        poa_reflected = ghi * ground_albedo * ground_view_factor
+        poa_global = max(0.0, poa_direct + poa_diffuse + poa_reflected)
+
+        if not hasattr(row, "air_temperature_C"):
+            raise RuntimeError(
+                "Hourly air temperature has not been attached to the solar data."
+            )
+
+        air_temperature = float(row.air_temperature_C)
+
+        if USE_TEMPERATURE_CORRECTION:
+            cell_temperature = (
+                air_temperature
+                + (
+                    (NOCT - NOCT_REFERENCE_AMBIENT_TEMPERATURE)
+                    / NOCT_REFERENCE_IRRADIANCE
+                )
+                * poa_global
+            )
+
+            temperature_factor = (
+                1.0
+                + TEMPERATURE_COEFFICIENT
+                * (
+                    cell_temperature
+                    - REFERENCE_CELL_TEMPERATURE
+                )
+            )
+            temperature_factor = max(0.0, temperature_factor)
+        else:
+            cell_temperature = air_temperature
+            temperature_factor = 1.0
+
+        capacity_factor = DERATING_FACTOR * poa_global / 1000.0 * temperature_factor
+        capacity_factor = max(0.0, capacity_factor)
+        if CLIP_AT_RATED_POWER:
+            capacity_factor = min(1.0, capacity_factor)
+
+        records.append(
+            {
+                "timestamp_utc": timestamp,
+                "year": int(timestamp.year),
+                "ghi_horizontal_Wm2": ghi,
+                "dhi_horizontal_Wm2": dhi,
+                "bhi_horizontal_Wm2": bhi,
+                "derived_dni_Wm2": derived_dni,
+                "solar_declination_deg": geometry.declination_deg,
+                "hour_angle_deg": geometry.hour_angle_deg,
+                "solar_zenith_deg": geometry.zenith_deg,
+                "solar_elevation_deg": geometry.elevation_deg,
+                "solar_azimuth_deg": geometry.azimuth_deg,
+                "incidence_angle_deg": geometry.incidence_deg,
+                "poa_direct_Wm2": poa_direct,
+                "poa_diffuse_Wm2": poa_diffuse,
+                "ground_albedo": ground_albedo,
+                "snow_cover_fraction_2015_reference": snow_cover_fraction,
+                "poa_ground_reflected_Wm2": poa_reflected,
+                "poa_global_Wm2": poa_global,
+                "air_temperature_C": air_temperature,
+                "cell_temperature_C": cell_temperature,
+                "temperature_factor": temperature_factor,
+                "capacity_factor_kW_per_kWp": capacity_factor,
+            }
+        )
+
+    return pd.DataFrame.from_records(records)
+
+
+def style_header(cell, fill, white):
+    cell.fill = PatternFill("solid", fgColor=fill)
+    cell.font = Font(name="Arial", bold=True, color=white)
+    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+
+def write_results(path: Path, results: pd.DataFrame, site: Site) -> None:
+    workbook = Workbook()
+    summary = workbook.active
+    summary.title = "Summary"
+
+    dark_blue = "1F4E78"
+    light_green = "E2F0D9"
+    white = "FFFFFF"
+
+    summary.merge_cells("A1:F1")
+    summary["A1"] = "Hornsund photovoltaic capacity factor"
+    summary["A1"].fill = PatternFill("solid", fgColor=dark_blue)
+    summary["A1"].font = Font(name="Arial", size=15, bold=True, color=white)
+    summary["A1"].alignment = Alignment(horizontal="left")
+
+    metadata = [
+        ("Site", site.name),
+        ("Latitude [deg]", site.latitude_deg),
+        ("Longitude [deg E]", site.longitude_east_deg),
+        ("Surface tilt [deg]", SURFACE_TILT),
+        ("Surface azimuth [deg]", SURFACE_AZIMUTH),
+        ("Minimum ground albedo [-]", ALBEDO_MIN),
+        ("Maximum ground albedo [-]", ALBEDO_MAX),
+        ("Albedo model", "rho(t) from 2015 Hornsund/Fuglebekken snow-cover reference"),
+        ("2015 snow-cover points", "17 May 90%; 10 Jun 75%; 15 Jun 50%; 20 Jun 25%; 27 Jun 10%; 06 Jul <2%"),
+        ("Interpolation", "Linear between observed 2015 SCE points"),
+        ("Before 17 May", "SCE = 1.0 -> rho = rho_max"),
+        ("From 06 July onward", "SCE = 0.0 -> rho = rho_min; autumn return not imposed"),
+        ("Derating factor [-]", DERATING_FACTOR),
+        ("Hourly conversion", HOURLY_CONVERSION),
+        ("Direct input interpretation", DIRECT_INPUT_TYPE),
+        ("Temperature correction", "ON - SEKLIMA hourly air temperature"),
+        ("NOCT [°C]", NOCT),
+        ("Temperature coefficient [1/°C]", TEMPERATURE_COEFFICIENT),
+        ("Reference cell temperature [°C]", REFERENCE_CELL_TEMPERATURE),
+        (
+            "NOCT reference ambient temperature [°C]",
+            NOCT_REFERENCE_AMBIENT_TEMPERATURE,
+        ),
+        ("NOCT reference irradiance [W/m²]", NOCT_REFERENCE_IRRADIANCE),
+        ("Temperature source UTC offset [h]", TEMPERATURE_TIME_OFFSET_HOURS),
+    ]
+    for idx, (label, value) in enumerate(metadata, start=3):
+        summary.cell(idx, 1, label)
+        summary.cell(idx, 2, value)
+
+    header_row = 3 + len(metadata) + 2
+    headers = [
+        "Year",
+        "Processed hours",
+        "Specific production (kWh/kWp)",
+        "Mean CF",
+        "Maximum CF",
+        "Mean POA irradiance (W/m²)",
+    ]
+    for column, header in enumerate(headers, start=1):
+        style_header(summary.cell(header_row, column, header), dark_blue, white)
+
+    years = sorted(results["year"].unique())
+    for offset, year in enumerate(years, start=1):
+        subset = results[results["year"] == year].copy()
+        row = header_row + offset
+        values = [
+            int(year),
+            len(subset),
+            float(subset["capacity_factor_kW_per_kWp"].sum()),
+            float(subset["capacity_factor_kW_per_kWp"].mean()),
+            float(subset["capacity_factor_kW_per_kWp"].max()),
+            float(subset["poa_global_Wm2"].mean()),
+        ]
+        for column, value in enumerate(values, start=1):
+            summary.cell(row, column, value)
+        summary.cell(row, 3).number_format = "#,##0.0"
+        for column in (4, 5):
+            summary.cell(row, column).number_format = "0.0000"
+        summary.cell(row, 6).number_format = "0.0"
+
+    for column, width in zip("ABCDEF", [12, 18, 31, 14, 14, 28]):
+        summary.column_dimensions[column].width = width
+
+    output_columns = [
+        "timestamp_utc",
+        "ghi_horizontal_Wm2",
+        "dhi_horizontal_Wm2",
+        "bhi_horizontal_Wm2",
+        "derived_dni_Wm2",
+        "solar_declination_deg",
+        "hour_angle_deg",
+        "solar_zenith_deg",
+        "solar_elevation_deg",
+        "solar_azimuth_deg",
+        "incidence_angle_deg",
+        "poa_direct_Wm2",
+        "poa_diffuse_Wm2",
+        "ground_albedo",
+        "snow_cover_fraction_2015_reference",
+        "poa_ground_reflected_Wm2",
+        "poa_global_Wm2",
+        "air_temperature_C",
+        "cell_temperature_C",
+        "temperature_factor",
+        "capacity_factor_kW_per_kWp",
+    ]
+
+    pretty_headers = [
+        "Date and time UTC",
+        "GHI horizontal (W/m²)",
+        "DHI horizontal (W/m²)",
+        "BHI horizontal / source Direct (W/m²)",
+        "Derived DNI (W/m²)",
+        "Solar declination (°)",
+        "Hour angle (°)",
+        "Solar zenith (°)",
+        "Solar elevation (°)",
+        "Solar azimuth (°)",
+        "PV incidence angle (°)",
+        "POA direct (W/m²)",
+        "POA diffuse (W/m²)",
+        "Ground albedo rho(t) (-)",
+        "Snow cover fraction - 2015 reference (-)",
+        "POA ground reflected (W/m²)",
+        "POA global (W/m²)",
+        "Air temperature (°C)",
+        "Cell temperature (°C)",
+        "Temperature factor (-)",
+        "Capacity factor (kW/kWp)",
+    ]
+
+    for year in years:
+        subset = results[results["year"] == year][output_columns].copy()
+        sheet = workbook.create_sheet(f"Hourly {int(year)}")
+        sheet.append(pretty_headers)
+        for cell in sheet[1]:
+            style_header(cell, dark_blue, white)
+        sheet.freeze_panes = "A2"
+
+        for values in subset.itertuples(index=False, name=None):
+            values = list(values)
+            ts = values[0]
+            if isinstance(ts, pd.Timestamp):
+                # Excel cannot store timezone-aware datetimes.
+                values[0] = ts.tz_convert("UTC").tz_localize(None).to_pydatetime()
+            sheet.append(values)
+
+        last_col = sheet.cell(1, len(output_columns)).column_letter
+        sheet.auto_filter.ref = f"A1:{last_col}{sheet.max_row}"
+        sheet.column_dimensions["A"].width = 20
+        for column_index in range(2, len(output_columns) + 1):
+            letter = sheet.cell(1, column_index).column_letter
+            sheet.column_dimensions[letter].width = 22
+
+        for row in range(2, sheet.max_row + 1):
+            sheet.cell(row, 1).number_format = "yyyy-mm-dd hh:mm"
+            for column in range(2, len(output_columns)):
+                sheet.cell(row, column).number_format = "0.00"
+            sheet.cell(row, len(output_columns)).number_format = "0.0000"
+
+    workbook.properties.title = "Hornsund hourly photovoltaic capacity factor"
+    workbook.properties.subject = "PV transposition from horizontal GHI/DHI/BHI data"
+    workbook.save(path)
+
+
+def plot_capacity_factor(results: pd.DataFrame) -> None:
+    for year in sorted(results["year"].unique()):
+        subset = results[results["year"] == year]
+        figure, axis = plt.subplots(figsize=(13, 5))
+        axis.plot(
+            subset["timestamp_utc"],
+            subset["capacity_factor_kW_per_kWp"],
+            linewidth=0.8,
+        )
+        axis.set_title(f"Hourly photovoltaic capacity factor - {int(year)}")
+        axis.set_xlabel("Month")
+        axis.set_ylabel("Capacity factor [kW/kWp]")
+        axis.set_ylim(bottom=0.0)
+        axis.xaxis.set_major_locator(mdates.MonthLocator())
+        axis.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+        axis.grid(True, linewidth=0.6)
+        figure.tight_layout()
+        plt.show()
+
+
+def print_summary(results: pd.DataFrame) -> None:
+    print("\nRESULTS")
+    print("-------")
+    for year in sorted(results["year"].unique()):
+        subset = results[results["year"] == year]
+        specific_yield = subset["capacity_factor_kW_per_kWp"].sum()
+        mean_cf = subset["capacity_factor_kW_per_kWp"].mean()
+        print(
+            f"{int(year)}: {len(subset)} h | "
+            f"specific production = {specific_yield:.1f} kWh/kWp | "
+            f"mean CF = {mean_cf:.4f}"
+        )
+
+    high_dni = (results["derived_dni_Wm2"] > 1400.0).sum()
+    if high_dni:
+        print(
+            f"WARNING: {high_dni} hourly points have derived DNI > 1400 W/m2. "
+            "This usually occurs close to the horizon and should be checked."
+        )
+
+
+def main(show_plot: bool = True) -> None:
+    print("=" * 78, flush=True)
+    print("HORNSUND PV CAPACITY FACTOR - WITH SEKLIMA TEMPERATURE", flush=True)
+    print("=" * 78, flush=True)
+
+    print("1. Select the Hornsund irradiation CSV...", flush=True)
+    input_path = choose_input_file()
+    site, source_3h = read_hornsund_csv(input_path)
+
+    print(f"3-hourly irradiation source records: {len(source_3h)}", flush=True)
+
+    print("2. Select the SEKLIMA file containing air temperature...", flush=True)
+    temperature_path = choose_temperature_file()
+
+    # Read once with the default +1 h offset. The chosen offset is applied again
+    # after the GUI in case the user changes it.
+    temperature_data = read_temperature_csv(temperature_path)
+
+    solar_years = sorted(
+        source_3h["timestamp"]
+        .dt.year
+        .dropna()
+        .astype(int)
+        .unique()
+        .tolist()
+    )
+
+    temperature_years = sorted(
+        temperature_data["timestamp_utc"]
+        .dt.year
+        .dropna()
+        .astype(int)
+        .unique()
+        .tolist()
+    )
+
+    candidate_years = sorted(
+        set(solar_years) & set(temperature_years)
+    )
+
+    if not candidate_years:
+        raise ValueError(
+            "No common year between irradiation and temperature files.\n"
+            f"Irradiation years: {solar_years}\n"
+            f"Temperature years: {temperature_years}"
+        )
+
+    year_counts = {
+        year: int((source_3h["timestamp"].dt.year == year).sum())
+        for year in candidate_years
+    }
+
+    print(f"Common available years: {candidate_years}", flush=True)
+
+    # One GUI: year + PV geometry + temperature-model parameters.
+    year, settings = ask_analysis_setup(
+        candidate_years,
+        year_counts,
+    )
+
+    apply_analysis_settings(settings)
+
+    # Re-read temperature after the user-selected time offset is applied.
+    temperature_data = read_temperature_csv(temperature_path)
+
+    print("\nSELECTED ANALYSIS", flush=True)
+    print("-----------------", flush=True)
+    print(f"Year: {year}", flush=True)
+    print(f"Surface tilt: {SURFACE_TILT:.2f} deg", flush=True)
+    print(f"Surface azimuth: {SURFACE_AZIMUTH:.2f} deg", flush=True)
+    print(f"Minimum ground albedo: {ALBEDO_MIN:.3f}", flush=True)
+    print(f"Maximum ground albedo: {ALBEDO_MAX:.3f}", flush=True)
+    print(
+    "Albedo model: dynamic rho(t) based on 2015 Hornsund/Fuglebekken snow-cover observations (17 May -> 06 July)",
+    flush=True,
+)
+    print(f"Derating factor: {DERATING_FACTOR:.3f}", flush=True)
+    print(f"Minimum solar elevation: {MIN_SOLAR_ELEVATION_DEG:.2f} deg", flush=True)
+    print(f"Direct input type: {DIRECT_INPUT_TYPE}", flush=True)
+    print(f"Hourly conversion: {HOURLY_CONVERSION}", flush=True)
+    print(f"Clip at rated power: {CLIP_AT_RATED_POWER}", flush=True)
+    print(f"Drop 29 February: {DROP_FEB29}", flush=True)
+    print(f"NOCT: {NOCT:.2f} °C", flush=True)
+    print(
+        f"Temperature coefficient: {TEMPERATURE_COEFFICIENT:.6f} 1/°C",
+        flush=True,
+    )
+    print(
+        f"Reference cell temperature: {REFERENCE_CELL_TEMPERATURE:.2f} °C",
+        flush=True,
+    )
+    print(
+        "NOCT reference conditions: "
+        f"{NOCT_REFERENCE_AMBIENT_TEMPERATURE:.2f} °C, "
+        f"{NOCT_REFERENCE_IRRADIANCE:.1f} W/m²",
+        flush=True,
+    )
+    print(
+        f"Temperature file UTC offset: +{TEMPERATURE_TIME_OFFSET_HOURS:g} h",
+        flush=True,
+    )
+    print(
+        f"Interpolate missing temperature: "
+        f"{INTERPOLATE_MISSING_TEMPERATURE}",
+        flush=True,
+    )
+
+    source_year = source_3h[
+        source_3h["timestamp"].dt.year == year
+    ].copy()
+
+    if source_year.empty:
+        raise ValueError(f"No irradiation data found for {year}.")
+
+    print(
+        f"3-hourly irradiation records used for {year}: {len(source_year)}",
+        flush=True,
+    )
+
+    hourly = to_hourly(source_year)
+
+    expected_hours = (
+        8760
+        if (DROP_FEB29 and pd.Timestamp(f"{year}-01-01").is_leap_year)
+        else (8784 if pd.Timestamp(f"{year}-01-01").is_leap_year else 8760)
+    )
+
+    print(
+        f"Hourly irradiation records after conversion: {len(hourly)} "
+        f"(expected {expected_hours})",
+        flush=True,
+    )
+
+    hourly, temperature_quality = attach_temperature(
+        hourly,
+        temperature_data,
+        year,
+    )
+
+    results = calculate_pv(hourly, site)
+    print_summary(results)
+
+    print("\nALBEDO PROFILE USED", flush=True)
+    print("-------------------", flush=True)
+    monthly_used = (
+        results.assign(month=results["timestamp_utc"].dt.month)
+        .groupby("month")["ground_albedo"]
+        .agg(["min", "mean", "max"])
+    )
+    for month, row in monthly_used.iterrows():
+        print(
+            f"Month {int(month):02d}: min={row['min']:.3f}, "
+            f"mean={row['mean']:.3f}, max={row['max']:.3f}",
+            flush=True,
+        )
+
+    print("\nTEMPERATURE DATA QUALITY", flush=True)
+    print("------------------------", flush=True)
+    print(
+        "Missing before fill: "
+        f"{temperature_quality['temperature_missing_before_fill']} h",
+        flush=True,
+    )
+    print(
+        "Longest missing gap: "
+        f"{temperature_quality['temperature_longest_missing_gap_h']} h",
+        flush=True,
+    )
+    print(
+        "Interpolation used: "
+        f"{temperature_quality['temperature_interpolation_used']}",
+        flush=True,
+    )
+
+    default_name = f"PV_capacity_factor_Hornsund_{year}_with_temperature.xlsx"
+    output_path = choose_output_file(default_name)
+
+    write_results(output_path, results, site)
+
+    print(f"\nCreated: {output_path}", flush=True)
+
+    if messagebox is not None:
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        messagebox.showinfo(
+            "PV capacity factor",
+            (
+                f"Calculation completed.\n\n"
+                f"Year: {year}\n"
+                f"Processed hours: {len(results)}\n"
+                f"Mean air temperature: "
+                f"{results['air_temperature_C'].mean():.2f} °C\n"
+                f"Mean cell temperature: "
+                f"{results['cell_temperature_C'].mean():.2f} °C\n"
+                f"Mean CF: "
+                f"{results['capacity_factor_kW_per_kWp'].mean():.4f}\n\n"
+                f"Saved file:\n{output_path}"
+            ),
+            parent=root,
+        )
+        root.destroy()
+
+    if show_plot:
+        plot_capacity_factor(results)
+
+
+if __name__ == "__main__":
+    main()
